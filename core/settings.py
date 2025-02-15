@@ -52,11 +52,16 @@ THIRD_PARTY_APPS = [
 ]
 
 LOCAL_APPS = [
-    'apps.accounts',
-    'apps.courses',
-    'apps.enrollments',
-    'apps.payments',
-    'apps.common',
+    'apps.accounts.apps.AccountsConfig',
+    'apps.courses.apps.CoursesConfig',
+    'apps.enrollments.apps.EnrollmentsConfig',
+    'apps.payments.apps.PaymentsConfig',
+    'apps.common.apps.CommonConfig',
+    # 'apps.accounts',
+    # 'apps.courses',
+    # 'apps.enrollments',
+    # 'apps.payments',
+    # 'apps.common',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
