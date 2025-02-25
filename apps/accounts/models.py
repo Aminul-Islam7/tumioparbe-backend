@@ -1,9 +1,59 @@
 from django.db import models
-from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.core.validators import RegexValidator, URLValidator
 
 
+class UserManager(BaseUserManager):
+    """
+    Custom User Manager to use phone number as the USERNAME_FIELD.
+    """
+
+    def create_user(self, phone, name, address, facebook_profile, password=None, **extra_fields):
+        """
+        Create and save a User with the given phone, name, address, facebook_profile, and password.
+        """
+        if not phone:
+            raise ValueError('The Phone number field must be set')
+
+        # Set the username to be the same as the phone number
+        extra_fields.setdefault('username', phone)
+        user = self.model(
+            phone=phone,
+            name=name,
+            address=address,
+            facebook_profile=facebook_profile,
+            **extra_fields
+        )
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, phone, name, address, facebook_profile, password=None, **extra_fields):
+        """
+        Create and save a SuperUser with the given phone, name, address, facebook_profile, and password.
+        """
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+        extra_fields.setdefault('is_admin', True)
+        extra_fields.setdefault('is_active', True)
+
+        if extra_fields.get('is_staff') is not True:
+            raise ValueError('Superuser must have is_staff=True.')
+        if extra_fields.get('is_superuser') is not True:
+            raise ValueError('Superuser must have is_superuser=True.')
+
+        return self.create_user(
+            phone=phone,
+            name=name,
+            address=address,
+            facebook_profile=facebook_profile,
+            password=password,
+            **extra_fields
+        )
+
+
 class User(AbstractUser):
+    name = models.CharField(max_length=100)  # Parent's Name
     phone = models.CharField(
         max_length=11,
         unique=True,
@@ -14,6 +64,11 @@ class User(AbstractUser):
     is_admin = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = UserManager()
+
+    USERNAME_FIELD = 'phone'  # Use phone as the username field
+    REQUIRED_FIELDS = ['name', 'address', 'facebook_profile']  # Required for creating a superuser
 
     class Meta:
         db_table = 'users'

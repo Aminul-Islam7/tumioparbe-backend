@@ -6,13 +6,16 @@ class Course(models.Model):
     description = models.TextField(blank=True)
     image = models.ImageField(upload_to='courses/', blank=True)
     admission_fee = models.DecimalField(max_digits=10, decimal_places=2)
-    tuition_fee = models.DecimalField(max_digits=10, decimal_places=2)
+    monthly_fee = models.DecimalField(max_digits=10, decimal_places=2)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = 'courses'
+
+        def __str__(self):
+            return self.name
 
 
 class Batch(models.Model):
@@ -28,3 +31,6 @@ class Batch(models.Model):
 
     class Meta:
         db_table = 'batches'
+
+        def __str__(self):
+            return f"{self.course.name} - {self.name}"
