@@ -204,3 +204,16 @@ ADMIN_PHONE_NUMBERS = os.getenv('ADMIN_PHONE_NUMBERS', '').split(',')
 # SMS settings (for OTP and reminders)
 SMS_ENABLED = os.getenv('SMS_ENABLED', 'False') == 'True'
 GREENWEB_API_TOKEN = os.getenv('GREENWEB_API_TOKEN', '')
+
+# bKash Payment Integration Settings
+BKASH_BASE_URL = os.getenv('BKASH_BASE_URL', 'https://checkout.sandbox.bka.sh/v1.2.0-beta')  # Use sandbox for development
+BKASH_APP_KEY = os.getenv('BKASH_APP_KEY', '')
+BKASH_APP_SECRET = os.getenv('BKASH_APP_SECRET', '')
+BKASH_USERNAME = os.getenv('BKASH_USERNAME', '')
+BKASH_PASSWORD = os.getenv('BKASH_PASSWORD', '')
+
+# bKash Callback URLs for frontend redirection after payment
+FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000')
+BKASH_CALLBACK_SUCCESS_URL = os.getenv('BKASH_CALLBACK_SUCCESS_URL', f"{FRONTEND_BASE_URL}/payment/success")
+BKASH_CALLBACK_FAILURE_URL = os.getenv('BKASH_CALLBACK_FAILURE_URL', f"{FRONTEND_BASE_URL}/payment/failure")
+BKASH_CALLBACK_CANCEL_URL = os.getenv('BKASH_CALLBACK_CANCEL_URL', f"{FRONTEND_BASE_URL}/payment/cancel")
