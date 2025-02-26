@@ -22,6 +22,21 @@ class BkashClient:
         self.token_expiration = None
         self.refresh_token = None
         self.timeout = 30  # 30 seconds timeout as recommended by bKash
+        logger.info(f"BkashClient initialized with base_url: {self.base_url}")
+
+    def debug_token(self):
+        """Debug the token information and credentials"""
+        logger.info(f"Token status: {'Valid' if self.token else 'None'}")
+        logger.info(f"Token expiration: {self.token_expiration}")
+        logger.info(f"Base URL: {self.base_url}")
+        # Log masked credentials for debugging (never log full credentials)
+        logger.info(f"App key: {self.app_key[:4]}...{self.app_key[-4:] if len(self.app_key) > 8 else ''}")
+        logger.info(f"Username: {self.username}")
+        return {
+            "token_exists": bool(self.token),
+            "expiration": self.token_expiration.isoformat() if self.token_expiration else None,
+            "base_url": self.base_url
+        }
 
     def _ensure_token(self):
         """Ensure a valid token is available. Get a new one if it doesn't exist or is expired."""
@@ -49,23 +64,42 @@ class BkashClient:
         }
 
         try:
+            logger.info(f"Requesting new token from {url}")
             response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+
+            # Log detailed response information for debugging
+            logger.info(f"Token request status code: {response.status_code}")
+
             response.raise_for_status()
 
             response_data = response.json()
+
+            # Verify we received an id_token
             self.token = response_data.get("id_token")
+            if not self.token:
+                logger.error(f"No id_token in response: {response_data}")
+                raise ValueError("No token provided in bKash response")
+
             self.refresh_token = response_data.get("refresh_token")
 
             # Calculate token expiration time (default is 3600 seconds)
             expires_in = response_data.get("expires_in", 3600)
             self.token_expiration = datetime.now() + timedelta(seconds=expires_in)
 
-            logger.info("Successfully obtained bKash token")
+            logger.info(f"Successfully obtained bKash token, expires in {expires_in} seconds")
+            return True
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get bKash token: {str(e)}")
             if hasattr(e, 'response') and e.response:
-                logger.error(f"Response: {e.response.text}")
+                logger.error(f"Response status code: {e.response.status_code}")
+                logger.error(f"Response body: {e.response.text}")
+
+            # Reset token information when request fails
+            self.token = None
+            self.token_expiration = None
+            self.refresh_token = None
+
             raise
 
     def _refresh_token(self):
@@ -123,29 +157,51 @@ class BkashClient:
         Returns:
             dict: Response data containing paymentID and bkashURL
         """
-        self._ensure_token()
-
-        url = f"{self.base_url}/tokenized/checkout/create"
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": self.token,
-            "X-App-Key": self.app_key
-        }
-
-        data = {
-            "mode": "0011",  # Checkout URL mode
-            "payerReference": customer_phone,
-            "callbackURL": callback_url,
-            "amount": str(amount),
-            "currency": "BDT",
-            "intent": "sale",
-            "merchantInvoiceNumber": invoice_number
-        }
-
         try:
+            self._ensure_token()
+
+            url = f"{self.base_url}/tokenized/checkout/create"
+
+            # Debug information
+            logger.info(f"Creating payment for invoice {invoice_number} with amount {amount}")
+            logger.info(f"Using token prefix: {self.token[:10]}... (token exists: {bool(self.token)})")
+
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.token}",  # Fix: Add 'Bearer ' prefix
+                "X-App-Key": self.app_key
+            }
+
+            data = {
+                "mode": "0011",  # Checkout URL mode
+                "payerReference": customer_phone,
+                "callbackURL": callback_url,
+                "amount": str(amount),
+                "currency": "BDT",
+                "intent": "sale",
+                "merchantInvoiceNumber": invoice_number
+            }
+
+            logger.info(f"Sending request to {url}")
             response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+
+            # Log response status
+            logger.info(f"bKash create payment response status: {response.status_code}")
+
+            if response.status_code == 401:
+                # Handle unauthorized error specifically - token might have expired even with our checks
+                logger.warning("Received 401 Unauthorized from bKash. Refreshing token and retrying...")
+                # Force get new token
+                self.token = None
+                self._ensure_token()
+
+                # Retry with new token
+                headers["Authorization"] = f"Bearer {self.token}"  # Fix: Add 'Bearer ' prefix
+                logger.info("Retrying with new token...")
+                response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+                logger.info(f"Retry response status: {response.status_code}")
+
             response.raise_for_status()
 
             response_data = response.json()
@@ -159,7 +215,8 @@ class BkashClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error creating bKash payment: {str(e)}")
             if hasattr(e, 'response') and e.response:
-                logger.error(f"Response: {e.response.text}")
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response body: {e.response.text}")
             raise
 
     def execute_payment(self, payment_id):
@@ -178,7 +235,7 @@ class BkashClient:
 
         headers = {
             "Accept": "application/json",
-            "Authorization": self.token,
+            "Authorization": f"Bearer {self.token}",  # Fix: Add 'Bearer ' prefix
             "X-App-Key": self.app_key
         }
 
@@ -188,6 +245,15 @@ class BkashClient:
 
         try:
             response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+
+            # Handle 401 errors with token refresh
+            if response.status_code == 401:
+                logger.warning("Received 401 Unauthorized. Refreshing token and retrying...")
+                self.token = None
+                self._ensure_token()
+                headers["Authorization"] = f"Bearer {self.token}"
+                response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+
             response.raise_for_status()
 
             response_data = response.json()
@@ -201,7 +267,8 @@ class BkashClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error executing bKash payment: {str(e)}")
             if hasattr(e, 'response') and e.response:
-                logger.error(f"Response: {e.response.text}")
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response body: {e.response.text}")
             raise
 
     def query_payment(self, payment_id):
@@ -221,7 +288,7 @@ class BkashClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": self.token,
+            "Authorization": f"Bearer {self.token}",  # Fix: Add 'Bearer ' prefix
             "X-App-Key": self.app_key
         }
 
@@ -231,6 +298,15 @@ class BkashClient:
 
         try:
             response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+
+            # Handle 401 errors with token refresh
+            if response.status_code == 401:
+                logger.warning("Received 401 Unauthorized. Refreshing token and retrying...")
+                self.token = None
+                self._ensure_token()
+                headers["Authorization"] = f"Bearer {self.token}"
+                response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
+
             response.raise_for_status()
 
             response_data = response.json()
@@ -244,5 +320,6 @@ class BkashClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error querying bKash payment: {str(e)}")
             if hasattr(e, 'response') and e.response:
-                logger.error(f"Response: {e.response.text}")
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response body: {e.response.text}")
             raise

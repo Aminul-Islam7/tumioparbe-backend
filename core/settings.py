@@ -50,7 +50,9 @@ THIRD_PARTY_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',
     'django_filters',
-    'django_extensions'
+    'django_extensions',
+    'django_celery_results',
+    'django_celery_beat',
 ]
 
 LOCAL_APPS = [
@@ -168,7 +170,7 @@ AUTH_PASSWORD_VALIDATORS = [
 # https://docs.djangoproject.com/en/5.1/topics/i18n/
 
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Dhaka'
 USE_I18N = True
 USE_TZ = True
 
@@ -193,9 +195,28 @@ AUTH_USER_MODEL = 'accounts.User'
 # CORS settings
 CORS_ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', '').split(',')
 
-# Celery settings
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+# Cache Settings
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'django_cache_table',
+    }
+}
+
+# Session settings
+SESSION_ENGINE = 'django.contrib.sessions.backends.cached_db'
+
+# Celery settings - using database as broker and result backend
+CELERY_BROKER_URL = 'django://'
+CELERY_RESULT_BACKEND = 'django-db'
+CELERY_CACHE_BACKEND = 'default'
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# Additional Celery Config
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_RESULT_EXTENDED = True
+CELERY_WORKER_SEND_TASK_EVENTS = True
 
 # Admin List - Phone numbers that should be automatically given admin access
 ADMIN_PHONE_NUMBERS = os.getenv('ADMIN_PHONE_NUMBERS', '').split(',')
@@ -206,11 +227,12 @@ SMS_ENABLED = os.getenv('SMS_ENABLED', 'False') == 'True'
 GREENWEB_API_TOKEN = os.getenv('GREENWEB_API_TOKEN', '')
 
 # bKash Payment Integration Settings
-BKASH_BASE_URL = os.getenv('BKASH_BASE_URL', 'https://checkout.sandbox.bka.sh/v1.2.0-beta')  # Use sandbox for development
+BKASH_BASE_URL = os.getenv('BKASH_BASE_URL', 'https://tokenized.sandbox.bka.sh/v1.2.0-beta')  # Use sandbox for development
 BKASH_APP_KEY = os.getenv('BKASH_APP_KEY', '')
 BKASH_APP_SECRET = os.getenv('BKASH_APP_SECRET', '')
 BKASH_USERNAME = os.getenv('BKASH_USERNAME', '')
 BKASH_PASSWORD = os.getenv('BKASH_PASSWORD', '')
+# BKASH_WEBHOOK_SECRET = os.getenv('BKASH_WEBHOOK_SECRET', '')  # Get this from bKash
 
 # bKash Callback URLs for frontend redirection after payment
 FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000')

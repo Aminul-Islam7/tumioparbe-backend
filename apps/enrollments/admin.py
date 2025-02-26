@@ -6,7 +6,7 @@ from apps.enrollments.models import Enrollment, Coupon
 
 @admin.register(Enrollment)
 class EnrollmentAdmin(admin.ModelAdmin):
-    list_display = ('student_name', 'parent_name', 'course_name', 'batch_name', 'start_month_display', 'tuition_fee_display', 'is_active', 'created_at')
+    list_display = ('enrollment_id', 'student_name', 'parent_name', 'course_name', 'batch_name', 'start_month_display', 'tuition_fee_display', 'is_active', 'created_at')
     list_filter = ('is_active', 'start_month', 'batch__course', 'batch')
     search_fields = ('student__name', 'student__parent__name', 'batch__name', 'batch__course__name')
     readonly_fields = ('created_at', 'updated_at', 'invoices_link')
@@ -26,6 +26,13 @@ class EnrollmentAdmin(admin.ModelAdmin):
         }),
     )
     raw_id_fields = ('student', 'batch')
+    list_select_related = ('student', 'student__parent', 'batch', 'batch__course')
+
+    def enrollment_id(self, obj):
+        url = reverse('admin:enrollments_enrollment_change', args=[obj.id])
+        return format_html('<a href="{}">{}</a>', url, f"ENR-{obj.id}")
+    enrollment_id.short_description = 'Enrollment ID'
+    enrollment_id.admin_order_field = 'id'
 
     def student_name(self, obj):
         url = reverse('admin:accounts_student_change', args=[obj.student.id])
@@ -63,7 +70,12 @@ class EnrollmentAdmin(admin.ModelAdmin):
         # Check if the fee is different from the batch/course fee
         batch_fee = obj.batch.tuition_fee or obj.batch.course.monthly_fee
 
-        if obj.tuition_fee != batch_fee:
+        if obj.tuition_fee is None:
+            # Show the inherited fee if tuition_fee is not set
+            return format_html('৳{} <span style="color: #888; font-size: 0.8em;">(from {})</span>',
+                               batch_fee,
+                               "batch" if obj.batch.tuition_fee else "course")
+        elif obj.tuition_fee != batch_fee:
             return format_html('<span style="color: green; font-weight: bold;">৳{}</span> <span style="color: #888; font-size: 0.8em;">(Custom)</span>', obj.tuition_fee)
         else:
             return format_html('৳{}', obj.tuition_fee)
@@ -79,6 +91,19 @@ class EnrollmentAdmin(admin.ModelAdmin):
         return super().get_queryset(request).select_related(
             'student', 'student__parent', 'batch', 'batch__course'
         )
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if 'tuition_fee' in form.base_fields:
+            form.base_fields['tuition_fee'].required = False
+        return form
+
+    def save_model(self, request, obj, form, change):
+        # If tuition_fee is empty/None, don't save it (let it be null)
+        # The view layer will handle fallbacks to batch or course fee
+        if form.cleaned_data.get('tuition_fee') is None:
+            obj.tuition_fee = None
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(Coupon)

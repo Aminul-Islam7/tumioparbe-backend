@@ -316,7 +316,9 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     month=date.fromisoformat(start_month),
                     amount=total_amount,
                     is_paid=False,
-                    coupon=coupon
+                    coupon=coupon,
+                    temp_invoice=True,  # Mark as temporary invoice
+                    temp_invoice_data=enrollment_data  # Store enrollment data for webhook
                 )
 
                 # Generate merchant invoice number
@@ -395,43 +397,83 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
         payment_id = request.data.get('bkash_payment_id')
         temp_invoice_id = request.data.get('temp_invoice_id')
 
-        if not enrollment_data or not payment_id or not temp_invoice_id:
+        # Log the input data to help debugging
+        logger.info(f"complete_with_payment called with: enrollment_data={enrollment_data}, payment_id={payment_id}, temp_invoice_id={temp_invoice_id}")
+
+        if not enrollment_data or not temp_invoice_id:
             return Response(
-                {"error": "enrollment_data, bkash_payment_id, and temp_invoice_id are required"},
+                {"error": "enrollment_data and temp_invoice_id are required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Verify the payment with bKash
-        try:
-            # Get the payment record
+        # Verify the payment with bKash if payment_id is provided
+        if payment_id:
             try:
-                payment = Payment.objects.get(payment_id=payment_id)
+                # Get the payment record
+                try:
+                    payment = Payment.objects.get(payment_id=payment_id)
+                    temp_invoice = Invoice.objects.get(id=temp_invoice_id)
+                except (Payment.DoesNotExist, Invoice.DoesNotExist):
+                    return Response(
+                        {"error": "Invalid payment or temp invoice ID"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # If payment is already marked as completed, skip execution
+                if payment.status == Payment.COMPLETED:
+                    logger.info(f"Payment {payment_id} is already marked as completed, skipping execution")
+                else:
+                    # Call bKash API to execute payment
+                    try:
+                        execute_response = bkash_client.execute_payment(payment_id)
+
+                        if execute_response.get("statusCode") == "0000" and execute_response.get("transactionStatus") == "Completed":
+                            # Update payment record on successful execution
+                            payment.status = Payment.COMPLETED
+                            payment.payment_execute_time = timezone.now()
+                            payment.transaction_id = execute_response.get('trxID', payment.transaction_id)
+                            payment.save()
+                        elif execute_response.get("statusCode") == "2062" and execute_response.get("statusMessage") == "The payment has already been completed":
+                            # If payment was already completed, verify with query API
+                            logger.info(f"Payment {payment_id} was already completed, verifying with query API")
+                            query_response = bkash_client.query_payment(payment_id)
+
+                            if query_response.get("statusCode") == "0000" and query_response.get("transactionStatus") == "Completed":
+                                # Payment is confirmed as completed
+                                payment.status = Payment.COMPLETED
+                                payment.payment_execute_time = timezone.now()
+                                payment.transaction_id = query_response.get('trxID', payment.transaction_id)
+                                payment.save()
+                                logger.info(f"Payment {payment_id} confirmed as completed via query API")
+                            else:
+                                # Payment status could not be verified
+                                return Response({
+                                    "error": "Payment verification failed",
+                                    "status_code": query_response.get("statusCode"),
+                                    "status_message": query_response.get("statusMessage")
+                                }, status=status.HTTP_400_BAD_REQUEST)
+                        else:
+                            # Payment execution failed for other reasons
+                            return Response({
+                                "error": "Payment execution failed",
+                                "status_code": execute_response.get("statusCode"),
+                                "status_message": execute_response.get("statusMessage")
+                            }, status=status.HTTP_400_BAD_REQUEST)
+                    except Exception as e:
+                        logger.error(f"Error during payment execution/verification: {str(e)}")
+                        return Response({"error": f"Failed to verify payment with bKash: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            except Exception as e:
+                logger.error(f"Error executing bKash payment: {str(e)}")
+                return Response({"error": f"Failed to verify payment with bKash: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        else:
+            # Get the temp invoice only
+            try:
                 temp_invoice = Invoice.objects.get(id=temp_invoice_id)
-            except (Payment.DoesNotExist, Invoice.DoesNotExist):
+            except Invoice.DoesNotExist:
                 return Response(
-                    {"error": "Invalid payment or temp invoice ID"},
+                    {"error": "Invalid temp invoice ID"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-            # Call bKash API to execute payment
-            execute_response = bkash_client.execute_payment(payment_id)
-
-            if execute_response.get("statusCode") != "0000" or execute_response.get("transactionStatus") != "Completed":
-                return Response({
-                    "error": "Payment execution failed",
-                    "status_code": execute_response.get("statusCode"),
-                    "status_message": execute_response.get("statusMessage")
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            # Update payment record
-            payment.status = Payment.COMPLETED
-            payment.payment_execute_time = timezone.now()
-            payment.transaction_id = execute_response.get('trxID', payment.transaction_id)
-            payment.save()
-
-        except Exception as e:
-            logger.error(f"Error executing bKash payment: {str(e)}")
-            return Response({"error": "Failed to verify payment with bKash."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # Create the enrollment
         serializer = self.get_serializer(data=enrollment_data)
@@ -443,61 +485,378 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             course = batch.course
 
             # Create invoice for the first month
-            first_month = date.fromisoformat(enrollment_data.get('start_month'))
+            first_month_str = enrollment_data.get('start_month')
+            if not first_month_str:
+                logger.error(f"Missing start_month in enrollment_data: {enrollment_data}")
+                return Response({"error": "start_month is required in enrollment_data"}, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                first_month = date.fromisoformat(first_month_str)
+            except ValueError as e:
+                logger.error(f"Invalid start_month format: {first_month_str}, error: {str(e)}")
+                return Response({"error": f"Invalid start_month format: {first_month_str}"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Check if enrollment has tuition_fee
+            tuition_fee = enrollment.tuition_fee
+            if tuition_fee is None:
+                # Fallback to batch or course tuition fee
+                tuition_fee = batch.tuition_fee or course.monthly_fee
+                logger.warning(f"Enrollment has no tuition_fee, using fallback: {tuition_fee}")
 
             # Check if a coupon was used
             coupon_code = enrollment_data.get('coupon_code')
             coupon = None
             first_month_waiver = False
+            # Initialize with Decimal type to ensure proper decimal handling
+            first_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
+
+            logger.info(f"Initial first_month_fee set to: {first_month_fee}")
 
             if coupon_code:
                 try:
                     coupon = Coupon.objects.get(code=coupon_code)
                     if 'FIRST_MONTH' in coupon.discount_types:
                         first_month_waiver = True
+                        first_month_fee = Decimal('0.00')
+                        logger.info("First month fee waived due to coupon")
                 except Coupon.DoesNotExist:
+                    logger.warning(f"Coupon code {coupon_code} not found")
                     pass
 
-            # Create the first month invoice (which is included in the enrollment payment)
-            first_month_invoice = Invoice.objects.create(
-                enrollment=enrollment,
-                month=first_month,
-                amount=Decimal('0.00') if first_month_waiver else enrollment.tuition_fee,
-                is_paid=True,  # First month is paid as part of enrollment
-                coupon=coupon
-            )
+            # Ensure the amount is never null - failsafe
+            if first_month_fee is None:
+                logger.error(f"first_month_fee is None after all calculations, using 0.00")
+                first_month_fee = Decimal('0.00')
 
-            # Associate the payment with the actual invoice and delete temporary invoice
-            payment.invoice = first_month_invoice
-            payment.save()
-            temp_invoice.delete()
+            logger.info(f"Creating invoice with amount: {first_month_fee}")
+
+            # Create the first month invoice (which is included in the enrollment payment)
+            try:
+                first_month_invoice = Invoice.objects.create(
+                    enrollment=enrollment,
+                    month=first_month,
+                    amount=first_month_fee,
+                    is_paid=True,  # First month is paid as part of enrollment
+                    coupon=coupon
+                )
+                logger.info(f"First month invoice created with ID: {first_month_invoice.id}, amount: {first_month_invoice.amount}")
+            except Exception as e:
+                logger.error(f"Error creating first month invoice: {str(e)}")
+                return Response({"error": f"Failed to create invoice: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            # If we have a payment, associate it with the actual invoice and delete temporary invoice
+            if payment_id and 'payment' in locals():
+                payment.invoice = first_month_invoice
+                payment.save()
+                logger.info(f"Payment {payment.id} updated to reference invoice {first_month_invoice.id}")
+
+            # Delete the temporary invoice regardless
+            if 'temp_invoice' in locals() and temp_invoice:
+                temp_invoice.delete()
+                logger.info(f"Temporary invoice {temp_invoice_id} deleted")
 
             # Calculate next month
-            last_day = calendar.monthrange(first_month.year, first_month.month)[1]
             next_month = date(
-                first_month.year + (first_month.month // 12),
-                (first_month.month % 12) + 1,
+                first_month.year + ((first_month.month) // 12),
+                ((first_month.month) % 12) + 1,
                 1
             )
 
+            # Ensure next month fee is never null
+            next_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
+            logger.info(f"Creating next month invoice with amount: {next_month_fee}")
+
             # Create next month's invoice (which will be due)
-            next_month_invoice = Invoice.objects.create(
-                enrollment=enrollment,
-                month=next_month,
-                amount=enrollment.tuition_fee,
-                is_paid=False
-            )
+            try:
+                next_month_invoice = Invoice.objects.create(
+                    enrollment=enrollment,
+                    month=next_month,
+                    amount=next_month_fee,
+                    is_paid=False
+                )
+                logger.info(f"Next month invoice created with ID: {next_month_invoice.id}")
+            except Exception as e:
+                logger.error(f"Error creating next month invoice: {str(e)}")
+                # Continue even if next month invoice creation fails
 
-            return Response({
+            response_data = {
                 "enrollment": serializer.data,
-                "payment_status": "Completed",
-                "transaction_id": payment.transaction_id,
-                "payment_method": "bKash",
                 "first_month_invoice_id": first_month_invoice.id,
-                "next_month_invoice_id": next_month_invoice.id
-            }, status=status.HTTP_201_CREATED)
+                "next_month_invoice_id": next_month_invoice.id if 'next_month_invoice' in locals() else None
+            }
 
+            # Add payment details if available
+            if payment_id and 'payment' in locals():
+                response_data.update({
+                    "payment_status": "Completed",
+                    "transaction_id": payment.transaction_id,
+                    "payment_method": "bKash"
+                })
+
+            return Response(response_data, status=status.HTTP_201_CREATED)
+
+        logger.error(f"Enrollment serializer errors: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'])
+    def verify_and_complete_payment(self, request):
+        """
+        Verify a payment status with bKash and complete the enrollment if payment was successful
+        This serves as a recovery mechanism when enrollment processing fails after successful payment
+        """
+        payment_id = request.data.get('bkash_payment_id')
+        enrollment_data = request.data.get('enrollment_data')
+        temp_invoice_id = request.data.get('temp_invoice_id')
+
+        logger.info(f"verify_and_complete_payment called with: payment_id={payment_id}, enrollment_data={enrollment_data}, temp_invoice_id={temp_invoice_id}")
+
+        if not payment_id or not enrollment_data or not temp_invoice_id:
+            return Response({
+                "error": "bkash_payment_id, enrollment_data, and temp_invoice_id are required"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if payment already exists and is completed
+        try:
+            # First, check if the payment exists in our database
+            try:
+                payment = Payment.objects.get(payment_id=payment_id)
+
+                # If payment exists and is already completed, check if enrollment exists
+                if payment.status == Payment.COMPLETED and payment.invoice and payment.invoice.enrollment:
+                    # Enrollment already completed, return success with enrollment details
+                    enrollment = payment.invoice.enrollment
+                    return Response({
+                        "message": "Enrollment is already completed for this payment",
+                        "enrollment": EnrollmentSerializer(enrollment).data,
+                        "payment_status": "Completed",
+                        "transaction_id": payment.transaction_id,
+                        "payment_method": payment.payment_method
+                    }, status=status.HTTP_200_OK)
+            except Payment.DoesNotExist:
+                # Payment doesn't exist in our system, we'll need to verify with bKash
+                logger.info(f"Payment {payment_id} not found in database, verifying with bKash")
+                pass
+
+            # Query bKash to verify payment status
+            query_response = bkash_client.query_payment(payment_id)
+
+            if query_response.get("statusCode") == "0000" and query_response.get("transactionStatus") == "Completed":
+                logger.info(f"Payment {payment_id} verified as completed via bKash query API")
+
+                # Get or create payment and temp invoice objects
+                try:
+                    payment = Payment.objects.get(payment_id=payment_id)
+                    # Update existing payment if needed
+                    if payment.status != Payment.COMPLETED:
+                        payment.status = Payment.COMPLETED
+                        payment.payment_execute_time = timezone.now()
+                        payment.transaction_id = query_response.get('trxID', payment.transaction_id)
+                        payment.save()
+                        logger.info(f"Updated existing payment {payment.id} status to COMPLETED")
+                except Payment.DoesNotExist:
+                    # Create payment record if it doesn't exist
+                    try:
+                        temp_invoice = Invoice.objects.get(id=temp_invoice_id)
+                        payment_amount = temp_invoice.amount
+                        customer_phone = query_response.get('customerMsisdn', '')
+
+                        payment = Payment.objects.create(
+                            invoice=temp_invoice,
+                            transaction_id=query_response.get('trxID', ''),
+                            amount=payment_amount,
+                            payment_method='bKash',
+                            status=Payment.COMPLETED,
+                            payment_id=payment_id,
+                            payer_reference=customer_phone,
+                            payment_create_time=timezone.now(),
+                            payment_execute_time=timezone.now()
+                        )
+                        logger.info(f"Created new payment record for {payment_id} with status COMPLETED")
+                    except Invoice.DoesNotExist:
+                        return Response({
+                            "error": "Temporary invoice not found"
+                        }, status=status.HTTP_400_BAD_REQUEST)
+
+                # Now proceed to create/complete the enrollment using the same logic as complete_with_payment
+                # Check if an enrollment already exists for this student and batch
+                student_id = enrollment_data.get('student')
+                batch_id = enrollment_data.get('batch')
+
+                if not student_id or not batch_id:
+                    return Response({
+                        "error": "Student ID and batch ID are required in enrollment_data"
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                try:
+                    existing_enrollment = Enrollment.objects.filter(
+                        student_id=student_id,
+                        batch_id=batch_id,
+                        is_active=True
+                    ).first()
+
+                    if existing_enrollment:
+                        logger.info(f"Found existing active enrollment for student {student_id} in batch {batch_id}")
+
+                        # If enrollment exists, make sure it's linked to the payment
+                        if 'payment' in locals():
+                            # Try to find the first month invoice for this enrollment
+                            first_month_invoice = Invoice.objects.filter(
+                                enrollment=existing_enrollment,
+                                month=existing_enrollment.start_month
+                            ).first()
+
+                            if first_month_invoice:
+                                # Link the payment to this invoice
+                                payment.invoice = first_month_invoice
+                                payment.save()
+                                logger.info(f"Linked payment {payment.id} to existing invoice {first_month_invoice.id}")
+
+                            # Delete any temporary invoice
+                            try:
+                                temp_invoice = Invoice.objects.get(id=temp_invoice_id)
+                                temp_invoice.delete()
+                                logger.info(f"Deleted temporary invoice {temp_invoice_id}")
+                            except Invoice.DoesNotExist:
+                                pass
+
+                        # Return the existing enrollment
+                        return Response({
+                            "message": "Enrollment already exists for this student in this batch",
+                            "enrollment": EnrollmentSerializer(existing_enrollment).data,
+                            "payment_status": "Completed",
+                            "transaction_id": payment.transaction_id if 'payment' in locals() else None,
+                            "payment_method": "bKash"
+                        }, status=status.HTTP_200_OK)
+                except Exception as e:
+                    logger.error(f"Error checking for existing enrollment: {str(e)}")
+                    # Continue with creating a new enrollment
+
+                # Create the enrollment if it doesn't exist
+                serializer = self.get_serializer(data=enrollment_data)
+
+                if serializer.is_valid():
+                    # Create the enrollment
+                    enrollment = serializer.save()
+                    logger.info(f"Created new enrollment with ID {enrollment.id}")
+
+                    # Get the batch and course details
+                    batch = enrollment.batch
+                    course = batch.course
+
+                    # Process first month invoice
+                    first_month_str = enrollment_data.get('start_month')
+                    if not first_month_str:
+                        logger.error(f"Missing start_month in enrollment_data: {enrollment_data}")
+                        return Response({"error": "start_month is required in enrollment_data"},
+                                        status=status.HTTP_400_BAD_REQUEST)
+
+                    try:
+                        first_month = date.fromisoformat(first_month_str)
+                    except ValueError as e:
+                        logger.error(f"Invalid start_month format: {first_month_str}, error: {str(e)}")
+                        return Response({"error": f"Invalid start_month format: {first_month_str}"},
+                                        status=status.HTTP_400_BAD_REQUEST)
+
+                    # Calculate fees and apply coupon
+                    tuition_fee = enrollment.tuition_fee
+                    if tuition_fee is None:
+                        tuition_fee = batch.tuition_fee or course.monthly_fee
+
+                    coupon_code = enrollment_data.get('coupon_code')
+                    coupon = None
+                    first_month_waiver = False
+                    first_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
+
+                    if coupon_code:
+                        try:
+                            coupon = Coupon.objects.get(code=coupon_code)
+                            if 'FIRST_MONTH' in coupon.discount_types:
+                                first_month_waiver = True
+                                first_month_fee = Decimal('0.00')
+                        except Coupon.DoesNotExist:
+                            logger.warning(f"Coupon code {coupon_code} not found")
+
+                    # Create the first month invoice
+                    try:
+                        first_month_invoice = Invoice.objects.create(
+                            enrollment=enrollment,
+                            month=first_month,
+                            amount=first_month_fee,
+                            is_paid=True,  # First month is paid as part of enrollment
+                            coupon=coupon
+                        )
+                        logger.info(f"Created first month invoice with ID {first_month_invoice.id}")
+
+                        # Link payment to the new invoice
+                        if 'payment' in locals():
+                            payment.invoice = first_month_invoice
+                            payment.save()
+                            logger.info(f"Linked payment {payment.id} to new invoice {first_month_invoice.id}")
+
+                        # Delete temporary invoice
+                        try:
+                            temp_invoice = Invoice.objects.get(id=temp_invoice_id)
+                            temp_invoice.delete()
+                            logger.info(f"Deleted temporary invoice {temp_invoice_id}")
+                        except Invoice.DoesNotExist:
+                            pass
+                    except Exception as e:
+                        logger.error(f"Error creating first month invoice: {str(e)}")
+                        return Response({"error": f"Failed to create invoice: {str(e)}"},
+                                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+                    # Create next month invoice
+                    next_month = date(
+                        first_month.year + ((first_month.month) // 12),
+                        ((first_month.month) % 12) + 1,
+                        1
+                    )
+
+                    next_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
+
+                    try:
+                        next_month_invoice = Invoice.objects.create(
+                            enrollment=enrollment,
+                            month=next_month,
+                            amount=next_month_fee,
+                            is_paid=False
+                        )
+                        logger.info(f"Created next month invoice with ID {next_month_invoice.id}")
+                    except Exception as e:
+                        logger.error(f"Error creating next month invoice: {str(e)}")
+                        # Continue even if next month invoice creation fails
+
+                    # Return success response
+                    response_data = {
+                        "message": "Enrollment recovery completed successfully",
+                        "enrollment": serializer.data,
+                        "payment_status": "Completed",
+                        "transaction_id": payment.transaction_id if 'payment' in locals() else None,
+                        "payment_method": "bKash",
+                        "first_month_invoice_id": first_month_invoice.id,
+                        "next_month_invoice_id": next_month_invoice.id if 'next_month_invoice' in locals() else None
+                    }
+
+                    return Response(response_data, status=status.HTTP_201_CREATED)
+                else:
+                    logger.error(f"Enrollment serializer errors: {serializer.errors}")
+                    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                # Payment is not completed
+                error_message = query_response.get('statusMessage', 'Payment verification failed')
+                status_code = query_response.get('statusCode', 'unknown')
+                logger.error(f"Payment verification failed: {error_message} (Code: {status_code})")
+
+                return Response({
+                    "error": "Payment verification failed",
+                    "status_code": status_code,
+                    "status_message": error_message
+                }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Error in verify_and_complete_payment: {str(e)}")
+            return Response({
+                "error": f"An error occurred while processing your request: {str(e)}"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class CouponViewSet(viewsets.ModelViewSet):

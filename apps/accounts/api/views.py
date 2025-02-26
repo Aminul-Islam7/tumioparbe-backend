@@ -6,8 +6,10 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django.conf import settings
+from django.core.cache import cache
 import random
 import logging
+import time
 
 from apps.accounts.models import Student
 from apps.accounts.api.serializers import UserSerializer, StudentSerializer
@@ -19,8 +21,20 @@ logger = logging.getLogger(__name__)
 # Get User model
 User = get_user_model()
 
-# Store OTPs temporarily (in production, use Redis or another cache)
-otp_store = {}
+# Cache keys
+
+
+def otp_cache_key(phone):
+    return f"otp:{phone}"
+
+
+def verified_phone_cache_key(phone):
+    return f"verified_phone:{phone}"
+
+
+# OTP expiration time (in seconds)
+OTP_EXPIRY = 300  # 5 minutes
+VERIFICATION_EXPIRY = 600  # 10 minutes
 
 
 @api_view(['POST'])
@@ -37,7 +51,9 @@ def request_otp(request):
 
     # Generate a 6-digit OTP
     otp = str(random.randint(100000, 999999))
-    otp_store[phone] = otp
+
+    # Store OTP in cache with expiration
+    cache.set(otp_cache_key(phone), otp, OTP_EXPIRY)
 
     # Send the OTP via SMS
     send_otp(phone, otp)
@@ -61,13 +77,20 @@ def verify_otp(request):
     if not phone or not otp:
         return Response({'error': 'Phone and OTP are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    # Get stored OTP from cache
+    stored_otp = cache.get(otp_cache_key(phone))
+
     # Check if OTP exists and is valid
-    if phone in otp_store and otp_store[phone] == otp:
+    if stored_otp and stored_otp == otp:
         # Clear the OTP after successful verification
-        del otp_store[phone]
+        cache.delete(otp_cache_key(phone))
+
+        # Mark phone as verified with timestamp in cache
+        cache.set(verified_phone_cache_key(phone), int(time.time()), VERIFICATION_EXPIRY)
+
         return Response({'success': True, 'message': 'OTP verified successfully.'})
     else:
-        return Response({'error': 'Invalid OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'Invalid OTP or OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class RegisterView(APIView):
@@ -79,12 +102,11 @@ class RegisterView(APIView):
     def post(self, request):
         # Check if the phone number has been verified first
         phone = request.data.get('phone')
-        otp_verified = request.data.get('otp_verified')
 
-        # In production, we'd check if the phone has been verified recently
-        # For now, we're allowing registration with a simple flag
-        if not otp_verified:
-            return Response({'error': 'Phone number must be verified first.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Check if the phone verification exists in cache
+        verification_time = cache.get(verified_phone_cache_key(phone))
+        if not verification_time:
+            return Response({'error': 'Phone number must be verified with OTP first.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Debug: Log the phone number and the admin phone numbers from settings
         admin_phones = settings.ADMIN_PHONE_NUMBERS
@@ -111,6 +133,9 @@ class RegisterView(APIView):
 
             # Generate tokens for automatic login
             refresh = RefreshToken.for_user(user)
+
+            # Remove the phone verification from cache after successful registration
+            cache.delete(verified_phone_cache_key(phone))
 
             return Response({
                 'user': UserSerializer(user).data,

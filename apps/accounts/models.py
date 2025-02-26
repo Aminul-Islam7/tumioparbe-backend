@@ -70,6 +70,9 @@ class User(AbstractUser):
     USERNAME_FIELD = 'phone'  # Use phone as the username field
     REQUIRED_FIELDS = ['name', 'address', 'facebook_profile']  # Required for creating a superuser
 
+    def __str__(self):
+        return f"{self.name} ({self.phone})"
+
     class Meta:
         db_table = 'users'
 
@@ -84,6 +87,9 @@ class Student(models.Model):
     mother_name = models.CharField(max_length=100)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} (Child of {self.parent.name})"
 
     class Meta:
         db_table = 'students'

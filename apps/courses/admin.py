@@ -89,3 +89,15 @@ class BatchAdmin(admin.ModelAdmin):
             return format_html('<a href="{}">{}</a>', url, count)
         return 0
     student_count.short_description = 'Students'
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if 'tuition_fee' in form.base_fields:
+            form.base_fields['tuition_fee'].required = False
+        return form
+
+    def save_model(self, request, obj, form, change):
+        # If tuition_fee is empty, set it to None
+        if form.cleaned_data.get('tuition_fee') is None:
+            obj.tuition_fee = None
+        super().save_model(request, obj, form, change)

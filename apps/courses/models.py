@@ -14,8 +14,8 @@ class Course(models.Model):
     class Meta:
         db_table = 'courses'
 
-        def __str__(self):
-            return self.name
+    def __str__(self):
+        return self.name
 
 
 class Batch(models.Model):
@@ -32,5 +32,5 @@ class Batch(models.Model):
     class Meta:
         db_table = 'batches'
 
-        def __str__(self):
-            return f"{self.course.name} - {self.name}"
+    def __str__(self):
+        return f"{self.course.name} - {self.name}"

@@ -5,9 +5,39 @@ from django.http import HttpResponseRedirect
 from django.contrib import messages
 from django.utils import timezone
 from django.utils.crypto import get_random_string
+from django import forms
 
 from apps.payments.models import Invoice, Payment
+from apps.accounts.models import Student
+from apps.courses.models import Batch
 from services.bkash import bkash_client
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Create a form to collect enrollment data for recovery (kept for backward compatibility)
+
+
+class EnrollmentRecoveryForm(forms.Form):
+    student = forms.ModelChoiceField(
+        queryset=Student.objects.all(),
+        label="Student",
+        widget=forms.Select(attrs={'class': 'select2'})
+    )
+    batch = forms.ModelChoiceField(
+        queryset=Batch.objects.all(),
+        label="Batch",
+        widget=forms.Select(attrs={'class': 'select2'})
+    )
+    start_month = forms.DateField(
+        label="Start Month (YYYY-MM-DD)",
+        widget=forms.DateInput(attrs={'type': 'date'})
+    )
+    coupon_code = forms.CharField(
+        max_length=20,
+        label="Coupon Code (Optional)",
+        required=False
+    )
 
 
 @admin.register(Invoice)
@@ -88,7 +118,10 @@ class InvoiceAdmin(admin.ModelAdmin):
     def payment_status(self, obj):
         if (obj.is_paid):
             if obj.payments.exists():
-                payment = obj.payments.first()
+                # Look for a completed payment first, then fall back to the most recent payment
+                completed_payment = obj.payments.filter(status=Payment.COMPLETED).first()
+                payment = completed_payment if completed_payment else obj.payments.order_by('-created_at').first()
+                
                 status_text = "Paid"
                 if payment.status == Payment.COMPLETED:
                     status_color = "green"
@@ -239,7 +272,7 @@ class PaymentAdmin(admin.ModelAdmin):
     list_display = ('transaction_id', 'invoice_details', 'amount_display', 'payment_method', 'payment_status_display', 'created_at')
     list_filter = ('payment_method', 'status', 'created_at')
     search_fields = ('transaction_id', 'payment_id', 'invoice__enrollment__student__name', 'invoice__enrollment__student__parent__phone')
-    readonly_fields = ('created_at', 'updated_at', 'bkash_details')
+    readonly_fields = ('created_at', 'updated_at', 'bkash_details', 'recovery_actions')
     fieldsets = (
         ('Payment Information', {
             'fields': ('invoice', 'transaction_id', 'amount', 'payment_method', 'status')
@@ -247,6 +280,10 @@ class PaymentAdmin(admin.ModelAdmin):
         ('bKash Details', {
             'fields': ('payment_id', 'payer_reference', 'bkash_details'),
             'classes': ('collapse',),
+        }),
+        ('Recovery Actions', {
+            'fields': ('recovery_actions',),
+            'description': 'Use these actions to fix payments and enrollments that may have failed or are incomplete.'
         }),
         ('Timestamps', {
             'fields': ('payment_create_time', 'payment_execute_time', 'created_at', 'updated_at'),
@@ -266,7 +303,66 @@ class PaymentAdmin(admin.ModelAdmin):
             return format_html('<span style="color:blue; font-weight:bold;">{}</span>', obj.status)
     payment_status_display.short_description = 'Status'
 
+    def recovery_actions(self, obj):
+        """Show recovery actions for bKash payments"""
+        if obj.payment_method != 'bKash' or not obj.payment_id:
+            return "Recovery options are only available for bKash payments."
+
+        html = ""
+
+        # First action: Verify and Complete Payment
+        verify_url = f"/admin/payments/payment/{obj.id}/auto-recover/"
+        html += format_html(
+            '<div style="margin-bottom:15px;">'
+            '<h4>Payment Recovery</h4>'
+            '<p>If the payment was successful but the enrollment was not completed, use this action:</p>'
+            '<a class="button" style="background:#2271b1; color:white;" href="{}">'
+            '<i class="fas fa-sync"></i> Automatically Recover Enrollment'
+            '</a>'
+            '<p style="color:#666; font-size:0.9em; margin-top:5px;">This will check the payment status with bKash and '
+            'automatically create the enrollment using stored data.</p>'
+            '</div>',
+            verify_url
+        )
+
+        # Second action: Search Transaction
+        if obj.status == Payment.COMPLETED:
+            html += format_html(
+                '<div style="margin-top:15px;">'
+                '<h4>Associated Enrollment</h4>'
+                '{}'
+                '</div>',
+                self._get_enrollment_status(obj)
+            )
+
+        return format_html(html)
+    recovery_actions.short_description = 'Recovery Actions'
+
+    def _get_enrollment_status(self, payment):
+        """Check if payment has an associated enrollment"""
+        from apps.enrollments.models import Enrollment
+
+        if not payment.invoice or not payment.invoice.enrollment:
+            return format_html(
+                '<p style="color:red;">⚠️ No enrollment is associated with this payment!</p>'
+                '<p>This could indicate a failed enrollment process.</p>'
+            )
+
+        enrollment = payment.invoice.enrollment
+        url = reverse('admin:enrollments_enrollment_change', args=[enrollment.id])
+
+        return format_html(
+            '<p style="color:green;">✅ Enrollment found:</p>'
+            '<p><strong>Student:</strong> {} | <strong>Batch:</strong> {} | <strong>Start Month:</strong> {}</p>'
+            '<a href="{}" class="button">View Enrollment</a>',
+            enrollment.student.name,
+            enrollment.batch.name,
+            enrollment.start_month.strftime('%b %Y'),
+            url
+        )
+
     def bkash_details(self, obj):
+        # Existing implementation...
         if obj.payment_method != 'bKash' or not obj.payment_id:
             return "Not a bKash payment or no bKash details available."
 
@@ -303,7 +399,6 @@ class PaymentAdmin(admin.ModelAdmin):
             )
 
         return format_html(html)
-    bkash_details.short_description = 'bKash Transaction Details'
 
     def amount_display(self, obj):
         return format_html('৳{}', obj.amount)
@@ -341,6 +436,15 @@ class PaymentAdmin(admin.ModelAdmin):
             path('<int:payment_id>/query-status/',
                  self.admin_site.admin_view(self.query_bkash_status_view),
                  name='payment-query-status'),
+            path('<int:payment_id>/verify-complete/',
+                 self.admin_site.admin_view(self.verify_complete_payment_view),
+                 name='payment-verify-complete'),
+            path('<int:payment_id>/complete-enrollment/',
+                 self.admin_site.admin_view(self.complete_enrollment_view),
+                 name='payment-complete-enrollment'),
+            path('<int:payment_id>/auto-recover/',
+                 self.admin_site.admin_view(self.auto_recover_enrollment),
+                 name='payment-auto-recover'),
         ]
         return custom_urls + urls
 
@@ -393,3 +497,282 @@ class PaymentAdmin(admin.ModelAdmin):
             messages.error(request, f"Error querying bKash payment status: {str(e)}")
 
         return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+    def verify_complete_payment_view(self, request, payment_id):
+        """Verify a payment status with bKash and show enrollment recovery form if successful"""
+        from apps.enrollments.models import Enrollment
+        from django.template import Context, Template
+
+        payment = Payment.objects.get(id=payment_id)
+
+        if payment.payment_method != 'bKash' or not payment.payment_id:
+            messages.error(request, "This is not a bKash payment or missing bKash payment ID.")
+            return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+        try:
+            # If the payment already has an enrollment associated with its invoice, inform the admin
+            if payment.invoice and payment.invoice.enrollment:
+                enrollment = payment.invoice.enrollment
+                messages.info(
+                    request,
+                    f"This payment already has an associated enrollment. "
+                    f"Student: {enrollment.student.name}, Batch: {enrollment.batch.name}"
+                )
+                return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+            # First, verify the payment with bKash to make sure it's actually successful
+            query_response = bkash_client.query_payment(payment.payment_id)
+
+            if query_response.get("statusCode") != "0000" or query_response.get("transactionStatus") != "Completed":
+                messages.error(
+                    request,
+                    f"This payment is not confirmed as successful by bKash. Status: {query_response.get('transactionStatus', 'Unknown')}"
+                )
+                return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+            # If not already completed, update payment status
+            if payment.status != Payment.COMPLETED:
+                payment.status = Payment.COMPLETED
+                payment.transaction_id = query_response.get('trxID', payment.transaction_id)
+                payment.payment_execute_time = timezone.now()
+                payment.save()
+                messages.success(request, f"Payment status updated to COMPLETED based on bKash verification.")
+
+            # Payment is verified, collect enrollment data
+            form = EnrollmentRecoveryForm()
+
+            # Check for potential temp_invoice_id
+            temp_invoice_id = None
+            if payment.invoice and not payment.invoice.enrollment:
+                temp_invoice_id = payment.invoice.id
+
+            # Helper function to properly render form fields
+            def render_field(field):
+                return str(field)
+
+            # Render a form for collecting enrollment data
+            recovery_form_html = f"""
+            <h1>Complete Enrollment Recovery</h1>
+            <p>Payment ID: {payment.payment_id} has been confirmed as successful by bKash.</p>
+            <p>Transaction ID: {payment.transaction_id}</p>
+            <p>Amount: ৳{payment.amount}</p>
+            
+            <form method="post" action="{reverse('admin:payment-complete-enrollment', args=[payment_id])}">
+                {{% csrf_token %}}
+                <input type="hidden" name="temp_invoice_id" value="{temp_invoice_id}">
+                
+                <div style="margin-bottom:15px;">
+                    <label for="id_student">Student:</label>
+                    {render_field(form['student'])}
+                </div>
+                
+                <div style="margin-bottom:15px;">
+                    <label for="id_batch">Batch:</label>
+                    {render_field(form['batch'])}
+                </div>
+                
+                <div style="margin-bottom:15px;">
+                    <label for="id_start_month">Start Month:</label>
+                    {render_field(form['start_month'])}
+                </div>
+                
+                <div style="margin-bottom:15px;">
+                    <label for="id_coupon_code">Coupon Code (Optional):</label>
+                    {render_field(form['coupon_code'])}
+                </div>
+                
+                <button type="submit" class="button button-primary">Complete Enrollment</button>
+            </form>
+            """
+
+            # Process the template to include the CSRF token
+            template = Template(recovery_form_html)
+            context = Context({'csrf_token': request.META.get('CSRF_COOKIE', '')})
+            final_html = template.render(context)
+
+            # Custom admin view response
+            from django.http import HttpResponse
+            return HttpResponse(final_html)
+
+        except Exception as e:
+            logger.error(f"Error in verify_complete_payment_view: {str(e)}")
+            messages.error(request, f"Error verifying payment status: {str(e)}")
+            return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+    def complete_enrollment_view(self, request, payment_id):
+        """Process the enrollment recovery form and complete the enrollment"""
+        from apps.enrollments.api.views import EnrollmentViewSet
+        from rest_framework.test import APIRequestFactory
+        from rest_framework.request import Request
+
+        if request.method != 'POST':
+            messages.error(request, "Invalid request method.")
+            return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+        payment = Payment.objects.get(id=payment_id)
+
+        try:
+            # Collect form data
+            student_id = request.POST.get('student')
+            batch_id = request.POST.get('batch')
+            start_month = request.POST.get('start_month')
+            coupon_code = request.POST.get('coupon_code', '')
+            temp_invoice_id = request.POST.get('temp_invoice_id')
+
+            # Validate required fields
+            if not all([student_id, batch_id, start_month]):
+                messages.error(request, "All required fields must be provided.")
+                return HttpResponseRedirect(reverse('admin:payment-verify-complete', args=[payment_id]))
+
+            # Create enrollment data
+            enrollment_data = {
+                'student': student_id,
+                'batch': batch_id,
+                'start_month': start_month
+            }
+
+            if coupon_code:
+                enrollment_data['coupon_code'] = coupon_code
+
+            # Create a proper request object for the viewset
+            factory = APIRequestFactory()
+            api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
+            api_request.data = {
+                'bkash_payment_id': payment.payment_id,
+                'enrollment_data': enrollment_data,
+                'temp_invoice_id': temp_invoice_id or payment.invoice.id
+            }
+            api_request.user = request.user  # Pass the admin user context
+
+            # Use the EnrollmentViewSet to complete the enrollment
+            viewset = EnrollmentViewSet()
+            viewset.request = Request(api_request)
+            response = viewset.verify_and_complete_payment(api_request)
+
+            # Check if enrollment was successful
+            if response.status_code in [200, 201]:
+                # Get the enrollment ID from the response
+                enrollment_id = None
+                if 'enrollment' in response.data:
+                    if isinstance(response.data['enrollment'], dict) and 'id' in response.data['enrollment']:
+                        enrollment_id = response.data['enrollment']['id']
+
+                success_message = f"Enrollment successfully completed! "
+                if enrollment_id:
+                    enrollment_url = reverse('admin:enrollments_enrollment_change', args=[enrollment_id])
+                    success_message += f'<a href="{enrollment_url}">View Enrollment</a>'
+
+                messages.success(request, format_html(success_message))
+            else:
+                error_message = "Failed to complete enrollment."
+                if 'error' in response.data:
+                    error_message += f" Error: {response.data['error']}"
+                messages.error(request, error_message)
+
+        except Exception as e:
+            logger.error(f"Error in complete_enrollment_view: {str(e)}")
+            messages.error(request, f"Error completing enrollment: {str(e)}")
+
+        return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+    def auto_recover_enrollment(self, request, payment_id):
+        """
+        Automatically recover an enrollment using the stored temporary invoice data
+        This is a fully automated version of the verify_complete_payment_view
+        """
+        from apps.enrollments.api.views import EnrollmentViewSet
+        from rest_framework.test import APIRequestFactory
+        from rest_framework.request import Request
+
+        payment = Payment.objects.get(id=payment_id)
+
+        if payment.payment_method != 'bKash' or not payment.payment_id:
+            messages.error(request, "This is not a bKash payment or missing bKash payment ID.")
+            return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+        try:
+            # If the payment already has an enrollment associated with its invoice, inform the admin
+            if payment.invoice and payment.invoice.enrollment:
+                enrollment = payment.invoice.enrollment
+                messages.info(
+                    request,
+                    f"This payment already has an associated enrollment. "
+                    f"Student: {enrollment.student.name}, Batch: {enrollment.batch.name}"
+                )
+                return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+            # First, verify the payment with bKash to make sure it's actually successful
+            query_response = bkash_client.query_payment(payment.payment_id)
+
+            if query_response.get("statusCode") != "0000" or query_response.get("transactionStatus") != "Completed":
+                messages.error(
+                    request,
+                    f"This payment is not confirmed as successful by bKash. Status: {query_response.get('transactionStatus', 'Unknown')}"
+                )
+                return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+            # Update payment status if not already completed
+            if payment.status != Payment.COMPLETED:
+                payment.status = Payment.COMPLETED
+                payment.transaction_id = query_response.get('trxID', payment.transaction_id)
+                payment.payment_execute_time = timezone.now()
+                payment.save()
+                messages.success(request, f"Payment status updated to COMPLETED based on bKash verification.")
+
+            # Get the enrollment data from the temp invoice
+            temp_invoice_id = payment.invoice.id
+            temp_invoice = Invoice.objects.get(id=temp_invoice_id)
+
+            if not temp_invoice.temp_invoice_data:
+                messages.error(request, "No enrollment data found in the temporary invoice. Please use the manual recovery option.")
+                return HttpResponseRedirect(reverse('admin:payment-verify-complete', args=[payment_id]))
+
+            enrollment_data = temp_invoice.temp_invoice_data
+
+            # Create a proper request object for the viewset
+            factory = APIRequestFactory()
+            api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
+            api_request.data = {
+                'bkash_payment_id': payment.payment_id,
+                'enrollment_data': enrollment_data,
+                'temp_invoice_id': temp_invoice_id
+            }
+            api_request.user = request.user  # Pass the admin user context
+
+            # Use the EnrollmentViewSet to complete the enrollment
+            viewset = EnrollmentViewSet()
+            viewset.request = Request(api_request)
+            response = viewset.verify_and_complete_payment(api_request)
+
+            # Check if enrollment was successful
+            if response.status_code in [200, 201]:
+                # Get the enrollment ID from the response
+                enrollment_id = None
+                if 'enrollment' in response.data:
+                    if isinstance(response.data['enrollment'], dict) and 'id' in response.data['enrollment']:
+                        enrollment_id = response.data['enrollment']['id']
+
+                success_message = f"Enrollment automatically recovered successfully! "
+                if enrollment_id:
+                    enrollment_url = reverse('admin:enrollments_enrollment_change', args=[enrollment_id])
+                    success_message += f'<a href="{enrollment_url}">View Enrollment</a>'
+
+                messages.success(request, format_html(success_message))
+            else:
+                error_message = "Failed to complete enrollment automatically."
+                if 'error' in response.data:
+                    error_message += f" Error: {response.data['error']}"
+
+                # Fall back to manual recovery if automatic fails
+                error_message += " Falling back to manual recovery option."
+                messages.warning(request, error_message)
+                return HttpResponseRedirect(reverse('admin:payment-verify-complete', args=[payment_id]))
+
+        except Exception as e:
+            logger.error(f"Error in auto_recover_enrollment: {str(e)}")
+            messages.error(request, f"Error automatically recovering enrollment: {str(e)}. Falling back to manual recovery.")
+            return HttpResponseRedirect(reverse('admin:payment-verify-complete', args=[payment_id]))
+
+        return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
+
+    # Keep existing methods for backward compatibility

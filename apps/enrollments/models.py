@@ -16,6 +16,9 @@ class Enrollment(models.Model):
         db_table = 'enrollments'
         unique_together = ['student', 'batch']
 
+    def __str__(self):
+        return f"{self.student.name} - {self.batch.name}"
+
 
 class Coupon(models.Model):
     DISCOUNT_TYPE_CHOICES = [
@@ -34,3 +37,6 @@ class Coupon(models.Model):
 
     class Meta:
         db_table = 'coupons'
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"

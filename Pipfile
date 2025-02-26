@@ -16,6 +16,8 @@ djangorestframework-simplejwt = "*"
 requests = "*"
 django-extensions = "*"
 python-dotenv = "*"
+django-celery-results = "*"
+django-celery-beat = "*"
 
 [dev-packages]
 

@@ -1,3 +1,10 @@
+from apps.enrollments.api.views import EnrollmentViewSet
+import json
+import base64
+import hashlib
+import hmac
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -101,7 +108,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def execute_bkash_payment(self, request):
         """
-        Execute a bKash payment after user has authorized it
+        Execute a bKash payment after user has authorized it and create enrollment if needed
         """
         payment_id = request.data.get('paymentID')
         if not payment_id:
@@ -129,6 +136,60 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 invoice.is_paid = True
                 invoice.save()
 
+                # Check if this is a new enrollment payment (temporary invoice)
+                if invoice.temp_invoice and invoice.temp_invoice_data and not invoice.enrollment:
+                    try:
+                        # Use a database transaction to ensure atomicity
+                        from django.db import transaction
+                        with transaction.atomic():
+                            # Complete the enrollment using the stored data
+                            from apps.enrollments.api.views import EnrollmentViewSet
+                            
+                            viewset = EnrollmentViewSet()
+                            enrollment_data = invoice.temp_invoice_data
+                            
+                            # Create a proper request object
+                            from rest_framework.test import APIRequestFactory
+                            from rest_framework.request import Request
+                            
+                            factory = APIRequestFactory()
+                            api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
+                            api_request.data = {
+                                'bkash_payment_id': payment_id,
+                                'enrollment_data': enrollment_data,
+                                'temp_invoice_id': invoice.id
+                            }
+                            api_request.user = request.user
+                            viewset.request = Request(api_request)
+                            
+                            # Complete the enrollment
+                            enrollment_response = viewset.verify_and_complete_payment(api_request)
+                            
+                            if enrollment_response.status_code not in [200, 201]:
+                                # If enrollment creation fails, roll back the transaction
+                                raise Exception(f"Enrollment creation failed: {enrollment_response.data}")
+                            
+                            # Add enrollment info to the response
+                            enrollment_info = enrollment_response.data.get('enrollment', {})
+                            
+                            return Response({
+                                "status": "success",
+                                "transaction_id": payment.transaction_id,
+                                "payment_status": payment.status,
+                                "message": "Payment completed and enrollment created successfully.",
+                                "enrollment": enrollment_info
+                            })
+                    except Exception as e:
+                        logger.error(f"Error creating enrollment after payment: {str(e)}")
+                        # Since we're using atomic transaction, both payment execution and enrollment
+                        # creation will be rolled back if an error occurs
+                        return Response({
+                            "status": "payment_succeeded_enrollment_failed",
+                            "message": f"Payment was successful but enrollment creation failed: {str(e)}",
+                            "transaction_id": payment.transaction_id
+                        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+                # Regular payment (not for new enrollment)
                 return Response({
                     "status": "success",
                     "transaction_id": payment.transaction_id,
@@ -363,13 +424,167 @@ class PaymentViewSet(viewsets.ModelViewSet):
         # Add additional fields to make it more user-friendly
         result = []
         for payment_data, payment in zip(serializer.data, payments):
-            payment_data['student_name'] = payment.invoice.enrollment.student.name
-            payment_data['course_name'] = payment.invoice.enrollment.batch.course.name
-            payment_data['batch_name'] = payment.invoice.enrollment.batch.name
-            payment_data['month'] = payment.invoice.month.strftime('%B %Y')
+            # Check if payment has an invoice with enrollment before accessing student info
+            if payment.invoice and payment.invoice.enrollment:
+                payment_data['student_name'] = payment.invoice.enrollment.student.name
+                payment_data['course_name'] = payment.invoice.enrollment.batch.course.name
+                payment_data['batch_name'] = payment.invoice.enrollment.batch.name
+                payment_data['month'] = payment.invoice.month.strftime('%B %Y')
+            else:
+                # Handle payments without enrollments (e.g., temporary invoices, failed payments)
+                payment_data['student_name'] = 'No student (Temporary/Pending)'
+                payment_data['course_name'] = 'N/A'
+                payment_data['batch_name'] = 'N/A'
+                payment_data['month'] = payment.invoice.month.strftime('%B %Y') if payment.invoice else 'N/A'
+
             result.append(payment_data)
 
         return Response(result)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class BkashWebhookView(APIView):
+    """Handle real-time payment notifications from bKash"""
+    permission_classes = []  # No auth required for webhooks
+
+    def verify_signature(self, request):
+        """Verify webhook signature using bKash's signing certificate"""
+        try:
+            # Get signature from headers
+            signature = request.headers.get('x-bkash-signature')
+            if not signature:
+                return False
+
+            # Get the raw request body
+            body = request.body.decode('utf-8')
+
+            # Create HMAC SHA256 hash using your bKash app secret
+            expected_signature = base64.b64encode(
+                hmac.new(
+                    settings.BKASH_APP_SECRET.encode('utf-8'),
+                    body.encode('utf-8'),
+                    hashlib.sha256
+                ).digest()
+            ).decode('utf-8')
+
+            # Compare signatures
+            return hmac.compare_digest(signature, expected_signature)
+
+        except Exception as e:
+            logger.error(f"Error verifying webhook signature: {str(e)}")
+            return False
+
+    def process_completed_payment(self, payload):
+        """Process a completed payment notification"""
+        try:
+            payment_id = payload.get('paymentID')
+            merchant_invoice_number = payload.get('merchantInvoiceNumber')
+            transaction_status = payload.get('transactionStatus')
+            trx_id = payload.get('trxID')
+
+            if not payment_id or transaction_status != 'Completed':
+                logger.error(f"Invalid webhook payload: {payload}")
+                return False
+
+            # Find the payment in our system
+            try:
+                payment = Payment.objects.get(payment_id=payment_id)
+            except Payment.DoesNotExist:
+                logger.error(f"Payment not found for ID: {payment_id}")
+                return False
+
+            # If payment is already completed, skip processing
+            if payment.status == Payment.COMPLETED:
+                logger.info(f"Payment {payment_id} is already completed")
+                return True
+
+            # Update payment status
+            payment.status = Payment.COMPLETED
+            payment.payment_execute_time = timezone.now()
+            payment.transaction_id = trx_id
+            payment.save()
+
+            # Update invoice
+            invoice = payment.invoice
+            invoice.is_paid = True
+            invoice.save()
+
+            # If this is an enrollment payment (no enrollment yet), complete the enrollment
+            if not invoice.enrollment and invoice.temp_invoice:
+                try:
+                    # Get enrollment data from temporary invoice
+                    enrollment_data = invoice.temp_invoice_data
+                    if enrollment_data:
+                        viewset = EnrollmentViewSet()
+                        # Complete the enrollment
+                        response = viewset.verify_and_complete_payment(
+                            request=None,  # Not needed for internal call
+                            data={
+                                'bkash_payment_id': payment_id,
+                                'enrollment_data': enrollment_data,
+                                'temp_invoice_id': invoice.id
+                            }
+                        )
+                        logger.info(f"Enrollment completed via webhook for payment {payment_id}")
+                        return True
+                except Exception as e:
+                    logger.error(f"Error completing enrollment via webhook: {str(e)}")
+                    # Don't return False here, the payment was still successful
+
+            logger.info(f"Successfully processed webhook for payment {payment_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing webhook: {str(e)}")
+            return False
+
+    def post(self, request):
+        """Handle POST notifications from bKash"""
+        # First verify the webhook signature
+        if not self.verify_signature(request):
+            logger.error("Invalid webhook signature")
+            return Response({"error": "Invalid signature"}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            # Parse the notification payload
+            payload = json.loads(request.body)
+
+            # Log the webhook payload for debugging
+            logger.info(f"Received bKash webhook: {payload}")
+
+            # Process based on notification type
+            notification_type = payload.get('Type')
+
+            if notification_type == 'SubscriptionConfirmation':
+                # Handle subscription confirmation
+                subscribe_url = payload.get('SubscribeURL')
+                if subscribe_url:
+                    # You would typically make a GET request to this URL to confirm
+                    logger.info(f"Webhook subscription URL: {subscribe_url}")
+                    return Response({"status": "Subscription noted"})
+
+            elif notification_type == 'Notification':
+                # Handle payment notification
+                message = json.loads(payload.get('Message', '{}'))
+                if self.process_completed_payment(message):
+                    return Response({"status": "Processed"})
+                else:
+                    return Response(
+                        {"error": "Failed to process payment"},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+
+            return Response({"error": "Unknown notification type"}, status=status.HTTP_400_BAD_REQUEST)
+
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON in webhook payload")
+            return Response({"error": "Invalid JSON"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Error processing webhook: {str(e)}")
+            return Response(
+                {"error": "Internal server error"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class BkashCallbackView(APIView):
