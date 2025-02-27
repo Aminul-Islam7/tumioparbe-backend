@@ -71,18 +71,27 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
+            # Check if the student is already enrolled in another batch of the same course
+            existing_enrollment = Enrollment.student_has_active_enrollment_in_course(student.id, course.id)
+            if existing_enrollment:
+                return Response(
+                    {"error": f"This student is already enrolled in batch '{existing_enrollment.batch.name}' of this course. A student cannot be enrolled in multiple batches of the same course simultaneously."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             # Calculate fees
             admission_fee = course.admission_fee
             tuition_fee = batch.tuition_fee or course.monthly_fee
 
             # Apply coupon if provided
             coupon = None
+            first_month_waiver = False
             if coupon_code:
                 try:
                     coupon = Coupon.objects.get(code=coupon_code)
 
                     # Check if coupon is expired
-                    if coupon.expires_at < date.today():
+                    if coupon.expires_at < timezone.now():
                         return Response(
                             {"error": "This coupon has expired"},
                             status=status.HTTP_400_BAD_REQUEST
@@ -96,17 +105,18 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         admission_fee = Decimal('0.00')
 
                     # Apply first month fee waiver if applicable
-                    first_month_waiver = False
                     if 'FIRST_MONTH' in discount_types:
-                        tuition_fee = Decimal('0.00')
                         first_month_waiver = True
+                        # First month tuition is waived
+                        # We don't set tuition_fee to 0 here as this will be used
+                        # to calculate the second month fee if first month is waived
 
                     # Apply tuition discount if applicable
                     if 'TUITION' in discount_types and coupon.discount_value:
                         # Apply percentage discount to tuition fee
-                        if not first_month_waiver:  # Only apply if first month isn't already waived
-                            discount = (tuition_fee * coupon.discount_value) / 100
-                            tuition_fee = tuition_fee - discount
+                        discount = (tuition_fee * coupon.discount_value) / 100
+                        tuition_fee = tuition_fee - discount
+                        # Store the discounted tuition fee, will be used for enrollment
 
                 except Coupon.DoesNotExist:
                     return Response(
@@ -114,8 +124,27 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-            # Calculate total amount to pay for enrollment
-            total_amount = admission_fee + tuition_fee
+            # Calculate total amount
+            # If first month is waived, include second month tuition in the enrollment payment
+            if first_month_waiver:
+                total_amount = admission_fee + tuition_fee  # Second month fee
+                logger.info(f"First month waived, showing admission ({admission_fee}) + second month fee ({tuition_fee})")
+                display_tuition_fee = Decimal('0.00')  # First month is free
+            else:
+                total_amount = admission_fee + tuition_fee  # First month fee
+                display_tuition_fee = tuition_fee
+                logger.info(f"Regular enrollment: admission ({admission_fee}) + first month fee ({tuition_fee})")
+
+            # Always require payment - No free enrollments
+            payment_required = True
+            if total_amount <= 0:
+                # If all fees are waived, still require at least 1 taka payment
+                # This is a business rule: no enrollment without payment
+                total_amount = Decimal('1.00')
+                logger.info("All fees waived, setting minimum payment amount to 1.00")
+
+            # Store the full tuition fee for use in the enrollment
+            stored_tuition_fee = tuition_fee if tuition_fee > 0 else batch.tuition_fee or course.monthly_fee
 
             # Create a response with enrollment details
             response_data = {
@@ -126,16 +155,18 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 "course_name": course.name,
                 "start_month": start_month,
                 "admission_fee": admission_fee,
-                "tuition_fee": tuition_fee,
+                "tuition_fee": display_tuition_fee,
                 "total_amount": total_amount,
                 "coupon_applied": bool(coupon),
-                "payment_required": total_amount > 0,
+                "payment_required": payment_required,
+                "first_month_waiver": first_month_waiver,
                 "enrollment_data": {
                     "student": student.id,
                     "batch": batch.id,
                     "start_month": start_month,
-                    "tuition_fee": tuition_fee if tuition_fee > 0 else batch.tuition_fee or course.monthly_fee,
-                    "coupon_code": coupon_code if coupon else None
+                    "tuition_fee": stored_tuition_fee,
+                    "coupon_code": coupon_code if coupon else None,
+                    "first_month_waiver": first_month_waiver
                 }
             }
 
@@ -267,10 +298,11 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
             # Apply coupon if provided
             coupon = None
+            first_month_waiver = False
             if coupon_code:
                 try:
                     coupon = Coupon.objects.get(code=coupon_code)
-                    if coupon.expires_at < date.today():
+                    if coupon.expires_at < timezone.now():
                         return Response(
                             {"error": "This coupon has expired"},
                             status=status.HTTP_400_BAD_REQUEST
@@ -281,15 +313,15 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     if 'ADMISSION' in discount_types:
                         admission_fee = Decimal('0.00')
 
-                    first_month_waiver = False
                     if 'FIRST_MONTH' in discount_types:
-                        tuition_fee = Decimal('0.00')
                         first_month_waiver = True
+                        # First month tuition is waived
+                        # We don't set tuition_fee to 0 here as we'll use it below for second month
 
                     if 'TUITION' in discount_types and coupon.discount_value:
-                        if not first_month_waiver:
-                            discount = (tuition_fee * coupon.discount_value) / 100
-                            tuition_fee = tuition_fee - discount
+                        # Apply percentage discount to tuition fee
+                        discount = (tuition_fee * coupon.discount_value) / 100
+                        tuition_fee = tuition_fee - discount
                 except Coupon.DoesNotExist:
                     return Response(
                         {"error": "Invalid coupon code"},
@@ -297,17 +329,24 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     )
 
             # Calculate total amount
-            total_amount = admission_fee + tuition_fee
+            # If first month is waived, include second month tuition in the enrollment payment
+            if first_month_waiver:
+                total_amount = admission_fee + tuition_fee  # Second month fee
+                logger.info(f"First month waived, charging admission ({admission_fee}) + second month fee ({tuition_fee})")
+            else:
+                total_amount = admission_fee + tuition_fee  # First month fee
+                logger.info(f"Regular enrollment payment: admission ({admission_fee}) + first month fee ({tuition_fee})")
+
+            # Always require payment - No free enrollments
             if total_amount <= 0:
-                return Response(
-                    {
-                        "message": "No payment required. You can complete the enrollment directly.",
-                        "total_amount": 0,
-                        "payment_required": False,
-                        "enrollment_data": enrollment_data
-                    },
-                    status=status.HTTP_200_OK
-                )
+                # If all fees are waived, still require at least 1 taka payment
+                # This is a business rule: no enrollment without payment
+                total_amount = Decimal('1.00')
+                logger.info("All fees waived, setting minimum payment amount to 1.00")
+
+            # Format total amount to have at most 2 decimal places for bKash
+            total_amount = Decimal(str(total_amount)).quantize(Decimal('0.01'))
+            logger.info(f"Formatted total amount for bKash: {total_amount}")
 
             # Create a temporary invoice
             try:
@@ -320,6 +359,11 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     temp_invoice=True,  # Mark as temporary invoice
                     temp_invoice_data=enrollment_data  # Store enrollment data for webhook
                 )
+
+                # Add first_month_waiver flag to enrollment data for use in complete_with_payment
+                enrollment_data['first_month_waiver'] = first_month_waiver
+                temp_invoice.temp_invoice_data = enrollment_data
+                temp_invoice.save()
 
                 # Generate merchant invoice number
                 merchant_invoice_number = f"ENR-{student_id}-{batch_id}-{get_random_string(6).upper()}"
@@ -359,6 +403,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         "bkash_payment_id": payment_response.get('paymentID'),
                         "bkash_url": payment_response.get('bkashURL'),
                         "total_amount": str(total_amount),
+                        "first_month_waiver": first_month_waiver,
                         "callback_urls": {
                             "success": payment_response.get('successCallbackURL'),
                             "failure": payment_response.get('failureCallbackURL'),
@@ -406,16 +451,41 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Get the temp invoice first
+        try:
+            temp_invoice = Invoice.objects.get(id=temp_invoice_id)
+
+            # Verify the temporary invoice is actually temporary and has no enrollment
+            if not temp_invoice.temp_invoice or temp_invoice.enrollment is not None:
+                logger.warning(f"Invalid temporary invoice: temp_invoice={temp_invoice_id}, is_temp={temp_invoice.temp_invoice}, has_enrollment={temp_invoice.enrollment is not None}")
+                return Response(
+                    {"error": "Invalid temporary invoice"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        except Invoice.DoesNotExist:
+            return Response(
+                {"error": "Invalid temp invoice ID"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Verify the payment with bKash if payment_id is provided
         if payment_id:
             try:
                 # Get the payment record
                 try:
                     payment = Payment.objects.get(payment_id=payment_id)
-                    temp_invoice = Invoice.objects.get(id=temp_invoice_id)
-                except (Payment.DoesNotExist, Invoice.DoesNotExist):
+
+                    # Verify that this payment is actually associated with the provided temporary invoice
+                    if payment.invoice.id != temp_invoice.id:
+                        logger.warning(f"Payment mismatch: payment {payment_id} is associated with invoice {payment.invoice.id}, not with provided temp_invoice {temp_invoice_id}")
+                        return Response(
+                            {"error": "The payment is not associated with the provided temporary invoice"},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                except Payment.DoesNotExist:
                     return Response(
-                        {"error": "Invalid payment or temp invoice ID"},
+                        {"error": "Invalid payment ID"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
@@ -465,15 +535,6 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             except Exception as e:
                 logger.error(f"Error executing bKash payment: {str(e)}")
                 return Response({"error": f"Failed to verify payment with bKash: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        else:
-            # Get the temp invoice only
-            try:
-                temp_invoice = Invoice.objects.get(id=temp_invoice_id)
-            except Invoice.DoesNotExist:
-                return Response(
-                    {"error": "Invalid temp invoice ID"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
 
         # Create the enrollment
         serializer = self.get_serializer(data=enrollment_data)
@@ -506,9 +567,9 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             # Check if a coupon was used
             coupon_code = enrollment_data.get('coupon_code')
             coupon = None
-            first_month_waiver = False
+            first_month_waiver = enrollment_data.get('first_month_waiver', False)
             # Initialize with Decimal type to ensure proper decimal handling
-            first_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
+            first_month_fee = Decimal('0.00') if first_month_waiver else Decimal(str(tuition_fee))
 
             logger.info(f"Initial first_month_fee set to: {first_month_fee}")
 
@@ -521,14 +582,13 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         logger.info("First month fee waived due to coupon")
                 except Coupon.DoesNotExist:
                     logger.warning(f"Coupon code {coupon_code} not found")
-                    pass
 
             # Ensure the amount is never null - failsafe
             if first_month_fee is None:
                 logger.error(f"first_month_fee is None after all calculations, using 0.00")
                 first_month_fee = Decimal('0.00')
 
-            logger.info(f"Creating invoice with amount: {first_month_fee}")
+            logger.info(f"Creating first month invoice with amount: {first_month_fee}")
 
             # Create the first month invoice (which is included in the enrollment payment)
             try:
@@ -544,17 +604,6 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 logger.error(f"Error creating first month invoice: {str(e)}")
                 return Response({"error": f"Failed to create invoice: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            # If we have a payment, associate it with the actual invoice and delete temporary invoice
-            if payment_id and 'payment' in locals():
-                payment.invoice = first_month_invoice
-                payment.save()
-                logger.info(f"Payment {payment.id} updated to reference invoice {first_month_invoice.id}")
-
-            # Delete the temporary invoice regardless
-            if 'temp_invoice' in locals() and temp_invoice:
-                temp_invoice.delete()
-                logger.info(f"Temporary invoice {temp_invoice_id} deleted")
-
             # Calculate next month
             next_month = date(
                 first_month.year + ((first_month.month) // 12),
@@ -562,27 +611,73 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 1
             )
 
-            # Ensure next month fee is never null
-            next_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
-            logger.info(f"Creating next month invoice with amount: {next_month_fee}")
+            # Important fix: Don't apply discount twice for subsequent months
+            # The enrollment.tuition_fee already has any tuition discounts applied
+            # Determine if next month is already paid (in case of first_month_waiver)
+            next_month_is_paid = first_month_waiver
+            next_month_fee = tuition_fee
 
-            # Create next month's invoice (which will be due)
+            logger.info(f"Creating next month invoice with amount: {next_month_fee}, paid status: {next_month_is_paid}")
+
+            # Create next month's invoice
             try:
                 next_month_invoice = Invoice.objects.create(
                     enrollment=enrollment,
                     month=next_month,
                     amount=next_month_fee,
-                    is_paid=False
+                    is_paid=next_month_is_paid,  # Mark as paid if first month was waived
+                    coupon=coupon if next_month_is_paid else None  # Associate coupon if it was used for payment
                 )
-                logger.info(f"Next month invoice created with ID: {next_month_invoice.id}")
+                logger.info(f"Next month invoice created with ID {next_month_invoice.id}")
             except Exception as e:
                 logger.error(f"Error creating next month invoice: {str(e)}")
                 # Continue even if next month invoice creation fails
 
+            # If we have a payment, associate it with the appropriate invoice and delete temporary invoice
+            if payment_id and 'payment' in locals():
+                if first_month_waiver:
+                    # If first month was waived, payment was for next month
+                    payment.invoice = next_month_invoice
+                    logger.info(f"Payment {payment.id} updated to reference next month invoice {next_month_invoice.id}")
+                else:
+                    # Regular case: payment was for first month
+                    payment.invoice = first_month_invoice
+                    logger.info(f"Payment {payment.id} updated to reference first month invoice {first_month_invoice.id}")
+                payment.save()
+
+            # Delete the temporary invoice regardless
+            if 'temp_invoice' in locals() and temp_invoice:
+                temp_invoice.delete()
+                logger.info(f"Temporary invoice {temp_invoice_id} deleted")
+
+            # If first month is waived, create the third month invoice that will be due
+            if first_month_waiver:
+                # Calculate third month
+                third_month_year = next_month.year + ((next_month.month) // 12)
+                third_month_month = ((next_month.month) % 12) + 1
+                third_month = date(third_month_year, third_month_month, 1)
+
+                # Create third month invoice (unpaid)
+                try:
+                    # Important fix: Don't apply discount twice
+                    third_month_fee = tuition_fee
+
+                    third_month_invoice = Invoice.objects.create(
+                        enrollment=enrollment,
+                        month=third_month,
+                        amount=third_month_fee,
+                        is_paid=False
+                    )
+                    logger.info(f"Third month invoice created with ID {third_month_invoice.id}")
+                except Exception as e:
+                    logger.error(f"Error creating third month invoice: {str(e)}")
+                    # Continue even if third month invoice creation fails
+
             response_data = {
                 "enrollment": serializer.data,
                 "first_month_invoice_id": first_month_invoice.id,
-                "next_month_invoice_id": next_month_invoice.id if 'next_month_invoice' in locals() else None
+                "next_month_invoice_id": next_month_invoice.id if 'next_month_invoice' in locals() else None,
+                "first_month_waiver": first_month_waiver
             }
 
             # Add payment details if available
@@ -764,7 +859,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
                     coupon_code = enrollment_data.get('coupon_code')
                     coupon = None
-                    first_month_waiver = False
+                    first_month_waiver = enrollment_data.get('first_month_waiver', False)
                     first_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
 
                     if coupon_code:
@@ -773,6 +868,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                             if 'FIRST_MONTH' in coupon.discount_types:
                                 first_month_waiver = True
                                 first_month_fee = Decimal('0.00')
+                                logger.info("First month fee waived due to coupon")
                         except Coupon.DoesNotExist:
                             logger.warning(f"Coupon code {coupon_code} not found")
 
@@ -805,26 +901,68 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         return Response({"error": f"Failed to create invoice: {str(e)}"},
                                         status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-                    # Create next month invoice
+                    # Calculate next month
                     next_month = date(
                         first_month.year + ((first_month.month) // 12),
                         ((first_month.month) % 12) + 1,
                         1
                     )
 
-                    next_month_fee = Decimal(str(tuition_fee)) if tuition_fee is not None else Decimal('0.00')
+                    # Important fix: Don't apply discount twice for subsequent months
+                    # The enrollment.tuition_fee already has any tuition discounts applied
+                    # Determine if next month is already paid (in case of first_month_waiver)
+                    next_month_is_paid = first_month_waiver
+                    next_month_fee = tuition_fee
+
+                    logger.info(f"Creating next month invoice with amount: {next_month_fee}, paid status: {next_month_is_paid}")
 
                     try:
                         next_month_invoice = Invoice.objects.create(
                             enrollment=enrollment,
                             month=next_month,
                             amount=next_month_fee,
-                            is_paid=False
+                            is_paid=next_month_is_paid,  # Mark as paid if first month was waived
+                            coupon=coupon if next_month_is_paid else None  # Associate coupon if it was used for payment
                         )
-                        logger.info(f"Created next month invoice with ID {next_month_invoice.id}")
+                        logger.info(f"Next month invoice created with ID {next_month_invoice.id}")
                     except Exception as e:
                         logger.error(f"Error creating next month invoice: {str(e)}")
                         # Continue even if next month invoice creation fails
+
+                    # If we have a payment, associate it with the appropriate invoice
+                    if payment_id and 'payment' in locals():
+                        if first_month_waiver:
+                            # If first month was waived, payment was for next month
+                            payment.invoice = next_month_invoice
+                            logger.info(f"Payment {payment.id} updated to reference next month invoice {next_month_invoice.id}")
+                        else:
+                            # Regular case: payment was for first month
+                            payment.invoice = first_month_invoice
+                            logger.info(f"Payment {payment.id} updated to reference first month invoice {first_month_invoice.id}")
+                        payment.save()
+
+                    # If first month is waived, create the third month invoice that will be due
+                    if first_month_waiver:
+                        # Calculate third month
+                        third_month_year = next_month.year + ((next_month.month) // 12)
+                        third_month_month = ((next_month.month) % 12) + 1
+                        third_month = date(third_month_year, third_month_month, 1)
+
+                        # Create third month invoice (unpaid)
+                        try:
+                            # Important fix: Don't apply discount twice
+                            third_month_fee = tuition_fee
+
+                            third_month_invoice = Invoice.objects.create(
+                                enrollment=enrollment,
+                                month=third_month,
+                                amount=third_month_fee,
+                                is_paid=False
+                            )
+                            logger.info(f"Third month invoice created with ID {third_month_invoice.id}")
+                        except Exception as e:
+                            logger.error(f"Error creating third month invoice: {str(e)}")
+                            # Continue even if third month invoice creation fails
 
                     # Return success response
                     response_data = {
@@ -858,6 +996,42 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 "error": f"An error occurred while processing your request: {str(e)}"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=True, methods=['post'])
+    def unenroll(self, request, pk=None):
+        """
+        Unenroll a student by deactivating their enrollment
+        This preserves historical invoices and payments while preventing future ones
+        """
+        try:
+            enrollment = self.get_object()
+
+            # Check if already unenrolled
+            if not enrollment.is_active:
+                return Response({
+                    "error": "This enrollment is already inactive"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Mark as inactive instead of deleting
+            enrollment.is_active = False
+            enrollment.save()
+
+            # Log the unenrollment
+            logger.info(f"Unenrolled student {enrollment.student.name} from {enrollment.batch.name}")
+
+            return Response({
+                "message": f"Successfully unenrolled {enrollment.student.name} from {enrollment.batch.course.name} - {enrollment.batch.name}",
+                "enrollment_id": enrollment.id,
+                "student_name": enrollment.student.name,
+                "batch_name": enrollment.batch.name,
+                "course_name": enrollment.batch.course.name
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error unenrolling student: {str(e)}")
+            return Response({
+                "error": f"An error occurred while unenrolling: {str(e)}"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class CouponViewSet(viewsets.ModelViewSet):
     """
@@ -887,20 +1061,66 @@ class CouponViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Optional parameters for calculating exact benefit amounts
+        admission_fee = request.query_params.get('admission_fee')
+        tuition_fee = request.query_params.get('tuition_fee')
+
         try:
             coupon = Coupon.objects.get(code=code)
 
             # Check if coupon is expired
-            if coupon.expires_at < date.today():
+            if coupon.expires_at < timezone.now():  # Use timezone.now() instead of date.today()
                 return Response(
                     {"error": "This coupon has expired"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            return Response(
-                CouponSerializer(coupon).data,
-                status=status.HTTP_200_OK
-            )
+            # Initialize response with coupon data
+            response_data = CouponSerializer(coupon).data
+
+            # Calculate benefits if fees are provided
+            benefits = []
+            if 'ADMISSION' in coupon.discount_types:
+                benefits.append({
+                    "type": "ADMISSION",
+                    "description": "Admission fee waived",
+                    "original_amount": admission_fee if admission_fee else None,
+                    "new_amount": "0.00"
+                })
+
+            if 'FIRST_MONTH' in coupon.discount_types:
+                benefits.append({
+                    "type": "FIRST_MONTH",
+                    "description": "First month tuition fee waived",
+                    "original_amount": tuition_fee if tuition_fee else None,
+                    "new_amount": "0.00"
+                })
+
+            if 'TUITION' in coupon.discount_types and coupon.discount_value:
+                if tuition_fee:
+                    from decimal import Decimal
+                    tuition_fee_decimal = Decimal(tuition_fee)
+                    discount_amount = (tuition_fee_decimal * coupon.discount_value) / 100
+                    new_amount = tuition_fee_decimal - discount_amount
+
+                    benefits.append({
+                        "type": "TUITION",
+                        "description": f"{coupon.discount_value}% discount on tuition fee",
+                        "original_amount": str(tuition_fee_decimal),
+                        "new_amount": str(new_amount),
+                        "discount_amount": str(discount_amount),
+                        "discount_percentage": str(coupon.discount_value)
+                    })
+                else:
+                    benefits.append({
+                        "type": "TUITION",
+                        "description": f"{coupon.discount_value}% discount on tuition fee",
+                        "discount_percentage": str(coupon.discount_value)
+                    })
+
+            response_data["benefits"] = benefits
+
+            return Response(response_data, status=status.HTTP_200_OK)
         except Coupon.DoesNotExist:
             return Response(
                 {"error": "Invalid coupon code"},

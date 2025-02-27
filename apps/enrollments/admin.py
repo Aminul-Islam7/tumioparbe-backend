@@ -1,7 +1,80 @@
 from django.contrib import admin
 from django.utils.html import format_html
-from django.urls import reverse
+from django.urls import reverse, path
+from django.forms import ModelForm, Select, MultipleChoiceField, CheckboxSelectMultiple
+from django.http import HttpResponseRedirect
+from django.contrib import messages
 from apps.enrollments.models import Enrollment, Coupon
+from django.utils import timezone  # Add this import
+
+
+class CouponAdminForm(ModelForm):
+    """Custom form for Coupon admin to provide better UI for discount_types"""
+    DISCOUNT_TYPE_CHOICES = [
+        ('TUITION', 'Tuition Discount (%)'),
+        ('ADMISSION', 'Admission Fee Waiver'),
+        ('FIRST_MONTH', 'First Month Tuition Waiver'),
+    ]
+
+    discount_types_field = MultipleChoiceField(
+        choices=DISCOUNT_TYPE_CHOICES,
+        widget=CheckboxSelectMultiple,
+        required=True,
+        help_text="Select one or more discount types. Multiple types can be combined."
+    )
+
+    class Meta:
+        model = Coupon
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Pre-select current values if editing existing coupon
+        if self.instance.pk and hasattr(self.instance, 'discount_types') and self.instance.discount_types:
+            self.initial['discount_types_field'] = self.instance.discount_types
+
+        # Add hint for discount value field
+        self.fields['discount_value'].help_text = "Percentage discount for tuition fee (only used if 'Tuition Discount' is selected)"
+
+    def clean(self):
+        cleaned_data = super().clean()
+        discount_types = cleaned_data.get('discount_types_field', [])
+
+        # Ensure discount_types is not empty
+        if not discount_types:
+            self.add_error('discount_types_field', 'At least one discount type must be selected')
+
+        discount_value = cleaned_data.get('discount_value')
+
+        # If TUITION is selected, discount_value is required
+        if 'TUITION' in discount_types and not discount_value:
+            self.add_error('discount_value', 'Discount value is required when Tuition Discount is selected')
+
+        # If TUITION is not selected but discount_value is provided, clear it
+        if 'TUITION' not in discount_types and discount_value:
+            cleaned_data['discount_value'] = None
+
+        # Copy the selected discount types to the JSON field
+        cleaned_data['discount_types'] = discount_types
+
+        return cleaned_data
+
+    def save(self, commit=True):
+        """Override save to ensure discount_types is properly set"""
+        instance = super().save(commit=False)
+
+        # Ensure discount_types is set to a valid value (at least an empty list)
+        if not hasattr(instance, 'discount_types') or instance.discount_types is None:
+            instance.discount_types = []
+
+        # Copy from the form field if available
+        if 'discount_types_field' in self.cleaned_data and self.cleaned_data['discount_types_field']:
+            instance.discount_types = self.cleaned_data['discount_types_field']
+
+        if commit:
+            instance.save()
+
+        return instance
 
 
 @admin.register(Enrollment)
@@ -27,6 +100,7 @@ class EnrollmentAdmin(admin.ModelAdmin):
     )
     raw_id_fields = ('student', 'batch')
     list_select_related = ('student', 'student__parent', 'batch', 'batch__course')
+    actions = ['unenroll_students']
 
     def enrollment_id(self, obj):
         url = reverse('admin:enrollments_enrollment_change', args=[obj.id])
@@ -87,6 +161,53 @@ class EnrollmentAdmin(admin.ModelAdmin):
         return format_html('<a class="button" href="{}">View Invoices</a>', url)
     invoices_link.short_description = 'Invoices'
 
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path('<int:enrollment_id>/unenroll/',
+                 self.admin_site.admin_view(self.unenroll_view),
+                 name='enrollment-unenroll'),
+        ]
+        return custom_urls + urls
+
+    def unenroll_view(self, request, enrollment_id):
+        """Unenroll a student from admin interface"""
+        enrollment = Enrollment.objects.get(id=enrollment_id)
+
+        if not enrollment.is_active:
+            messages.warning(request, f"Enrollment #{enrollment_id} is already inactive.")
+        else:
+            student_name = enrollment.student.name
+            batch_name = enrollment.batch.name
+            course_name = enrollment.batch.course.name
+
+            # Mark as inactive
+            enrollment.is_active = False
+            enrollment.save()
+
+            messages.success(
+                request,
+                f"Successfully unenrolled {student_name} from {course_name} - {batch_name}. "
+                "All historical payment records have been preserved."
+            )
+
+        return HttpResponseRedirect(reverse('admin:enrollments_enrollment_change', args=[enrollment_id]))
+
+    def unenroll_students(self, request, queryset):
+        """Bulk action to unenroll multiple students at once"""
+        active_enrollments = queryset.filter(is_active=True)
+        count = active_enrollments.count()
+
+        # Update to inactive
+        active_enrollments.update(is_active=False)
+
+        if count == 0:
+            messages.warning(request, "No active enrollments were found to unenroll.")
+        else:
+            messages.success(request, f"Successfully unenrolled {count} student(s). All historical payment records have been preserved.")
+
+    unenroll_students.short_description = "Unenroll selected students (preserve payment history)"
+
     def get_queryset(self, request):
         return super().get_queryset(request).select_related(
             'student', 'student__parent', 'batch', 'batch__course'
@@ -105,16 +226,28 @@ class EnrollmentAdmin(admin.ModelAdmin):
             obj.tuition_fee = None
         super().save_model(request, obj, form, change)
 
+    def change_view(self, request, object_id, form_url='', extra_context=None):
+        extra_context = extra_context or {}
+        enrollment = self.get_queryset(request).get(pk=object_id)
+
+        # Add custom action button for unenroll
+        if enrollment.is_active:
+            unenroll_url = reverse('admin:enrollment-unenroll', args=[object_id])
+            extra_context['unenroll_url'] = unenroll_url
+
+        return super().change_view(request, object_id, form_url, extra_context=extra_context)
+
 
 @admin.register(Coupon)
 class CouponAdmin(admin.ModelAdmin):
+    form = CouponAdminForm
     list_display = ('code', 'name', 'discount_types_display', 'discount_value_display', 'expires_at', 'is_expired')
     list_filter = ('expires_at',)
     search_fields = ('code', 'name')
     readonly_fields = ('created_at', 'updated_at')
     fieldsets = (
         ('Coupon Information', {
-            'fields': ('code', 'name', 'discount_types', 'discount_value', 'expires_at')
+            'fields': ('code', 'name', 'discount_types_field', 'discount_value', 'expires_at')
         }),
         ('Metadata', {
             'fields': ('created_at', 'updated_at'),
@@ -123,18 +256,37 @@ class CouponAdmin(admin.ModelAdmin):
     )
 
     def discount_types_display(self, obj):
+        """Display discount types with clear labels"""
         type_map = {
             'TUITION': 'Tuition Discount',
-            'ADMISSION': 'Admission Waiver',
+            'ADMISSION': 'Admission Fee Waiver',
             'FIRST_MONTH': 'First Month Waiver'
         }
 
         types = []
+        benefits = []
+
         for discount_type in obj.discount_types:
             if discount_type in type_map:
                 types.append(type_map[discount_type])
 
+                # Add specific benefit description
+                if discount_type == 'TUITION' and obj.discount_value:
+                    benefits.append(f"<li>{obj.discount_value}% off monthly tuition fee</li>")
+                elif discount_type == 'ADMISSION':
+                    benefits.append("<li>Admission fee waived (set to ৳0.00)</li>")
+                elif discount_type == 'FIRST_MONTH':
+                    benefits.append("<li>First month tuition fee waived</li>")
+
+        # Show discount types and benefits
+        if benefits:
+            return format_html(
+                "{}<br/><ul style='margin-top: 5px; margin-bottom: 0;'>{}</ul>",
+                ", ".join(types),
+                "".join(benefits)
+            )
         return ", ".join(types)
+
     discount_types_display.short_description = 'Discount Types'
 
     def discount_value_display(self, obj):
@@ -144,10 +296,12 @@ class CouponAdmin(admin.ModelAdmin):
     discount_value_display.short_description = 'Discount Value'
 
     def is_expired(self, obj):
-        from datetime import datetime
-        expired = obj.expires_at < datetime.now()
-        if expired:
-            return format_html('<span style="color:red;">Yes</span>')
-        return format_html('<span style="color:green;">No</span>')
+        """Check if the coupon is expired"""
+        return obj.expires_at < timezone.now()  # Return only the boolean result
     is_expired.short_description = 'Expired'
-    is_expired.boolean = True
+    is_expired.boolean = True  # This tells Django admin to display as a boolean icon
+
+    def save_model(self, request, obj, form, change):
+        """Custom save method to handle discount_types field"""
+        # discount_types is already set in the form's clean method
+        super().save_model(request, obj, form, change)
