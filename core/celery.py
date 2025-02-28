@@ -1,3 +1,4 @@
+from .celerybeat_schedules import CELERYBEAT_SCHEDULE
 import os
 from celery import Celery
 
@@ -13,6 +14,8 @@ app.config_from_object('django.conf:settings', namespace='CELERY')
 # Load task modules from all registered Django apps.
 app.autodiscover_tasks()
 
+# Import celerybeat schedule
+
 # Configure Celery to use the database as a message broker
 app.conf.update(
     broker_url='django://',
@@ -20,4 +23,5 @@ app.conf.update(
     task_eager_propagates=True,
     task_ignore_result=False,
     task_store_errors_even_if_ignored=True,
+    beat_schedule=CELERYBEAT_SCHEDULE,  # Add our schedule
 )

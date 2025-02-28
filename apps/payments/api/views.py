@@ -9,7 +9,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from django.shortcuts import get_object_or_404
 from django.utils.crypto import get_random_string
 from django.utils import timezone
@@ -17,7 +17,8 @@ from django.http import HttpResponseRedirect
 from django.conf import settings
 
 from apps.payments.models import Invoice, Payment
-from apps.payments.api.serializers import PaymentSerializer, PaymentInitiateSerializer, InvoiceSerializer
+from apps.enrollments.models import Enrollment, Coupon
+from apps.payments.api.serializers import PaymentSerializer, PaymentInitiateSerializer, InvoiceSerializer, ManualInvoiceCreateSerializer
 from services.bkash import bkash_client
 
 import logging
@@ -144,14 +145,14 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         with transaction.atomic():
                             # Complete the enrollment using the stored data
                             from apps.enrollments.api.views import EnrollmentViewSet
-                            
+
                             viewset = EnrollmentViewSet()
                             enrollment_data = invoice.temp_invoice_data
-                            
+
                             # Create a proper request object
                             from rest_framework.test import APIRequestFactory
                             from rest_framework.request import Request
-                            
+
                             factory = APIRequestFactory()
                             api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
                             api_request.data = {
@@ -161,17 +162,17 @@ class PaymentViewSet(viewsets.ModelViewSet):
                             }
                             api_request.user = request.user
                             viewset.request = Request(api_request)
-                            
+
                             # Complete the enrollment
                             enrollment_response = viewset.verify_and_complete_payment(api_request)
-                            
+
                             if enrollment_response.status_code not in [200, 201]:
                                 # If enrollment creation fails, roll back the transaction
                                 raise Exception(f"Enrollment creation failed: {enrollment_response.data}")
-                            
+
                             # Add enrollment info to the response
                             enrollment_info = enrollment_response.data.get('enrollment', {})
-                            
+
                             return Response({
                                 "status": "success",
                                 "transaction_id": payment.transaction_id,
@@ -188,7 +189,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
                             "message": f"Payment was successful but enrollment creation failed: {str(e)}",
                             "transaction_id": payment.transaction_id
                         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-                
+
                 # Regular payment (not for new enrollment)
                 return Response({
                     "status": "success",
@@ -440,6 +441,76 @@ class PaymentViewSet(viewsets.ModelViewSet):
             result.append(payment_data)
 
         return Response(result)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAdminUser])
+    def create_manual_invoice(self, request):
+        """
+        Create a manual invoice (admin only)
+        """
+        serializer = ManualInvoiceCreateSerializer(data=request.data)
+
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            # Get validated data
+            enrollment_id = serializer.validated_data['enrollment'].id
+            month = serializer.validated_data['month']
+            amount = serializer.validated_data['amount']
+            is_paid = serializer.validated_data['is_paid']
+            coupon_id = serializer.validated_data.get('coupon')
+            description = serializer.validated_data.get('description', 'Manual invoice created by admin')
+
+            # Get the enrollment
+            enrollment = get_object_or_404(Enrollment, id=enrollment_id)
+
+            # Get coupon if specified
+            coupon = None
+            if coupon_id:
+                coupon = get_object_or_404(Coupon, id=coupon_id)
+
+            # Create the invoice
+            invoice = Invoice.objects.create(
+                enrollment=enrollment,
+                month=month,
+                amount=amount,
+                is_paid=is_paid,
+                coupon=coupon
+            )
+
+            # If marked as paid, create a manual payment record
+            if is_paid:
+                transaction_id = f"MANUAL-{timezone.now().strftime('%Y%m%d')}-{get_random_string(6).upper()}"
+                payment = Payment.objects.create(
+                    invoice=invoice,
+                    transaction_id=transaction_id,
+                    amount=amount,
+                    payment_method='Manual',
+                    status=Payment.COMPLETED,
+                    payment_create_time=timezone.now(),
+                    payment_execute_time=timezone.now()
+                )
+
+                # Add payment info to response
+                payment_info = PaymentSerializer(payment).data
+            else:
+                payment_info = None
+
+            # Add the description to activity log (can be implemented later)
+            logger.info(f"Manual invoice #{invoice.id} created by admin {request.user.username} for {enrollment.student.name}, month: {month.strftime('%B %Y')}, amount: {amount}, paid: {is_paid}")
+
+            response_data = {
+                "invoice": InvoiceSerializer(invoice).data,
+                "payment": payment_info,
+                "message": "Manual invoice created successfully"
+            }
+
+            return Response(response_data, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.error(f"Error creating manual invoice: {str(e)}")
+            return Response({"error": f"Failed to create invoice: {str(e)}"},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @method_decorator(csrf_exempt, name='dispatch')
