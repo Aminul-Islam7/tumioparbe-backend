@@ -121,7 +121,7 @@ class InvoiceAdmin(admin.ModelAdmin):
                 # Look for a completed payment first, then fall back to the most recent payment
                 completed_payment = obj.payments.filter(status=Payment.COMPLETED).first()
                 payment = completed_payment if completed_payment else obj.payments.order_by('-created_at').first()
-                
+
                 status_text = "Paid"
                 if payment.status == Payment.COMPLETED:
                     status_color = "green"
@@ -265,6 +265,12 @@ class InvoiceAdmin(admin.ModelAdmin):
             messages.success(request, f"Invoice #{invoice_id} has been marked as unpaid. Existing payments have been marked as failed.")
 
         return HttpResponseRedirect(reverse('admin:payments_invoice_change', args=[invoice_id]))
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if 'coupon' in form.base_fields:
+            form.base_fields['coupon'].required = False
+        return form
 
 
 @admin.register(Payment)

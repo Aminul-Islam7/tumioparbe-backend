@@ -4,6 +4,7 @@ from django.urls import reverse, path
 from django.forms import ModelForm, Select, MultipleChoiceField, CheckboxSelectMultiple
 from django.http import HttpResponseRedirect
 from django.contrib import messages
+from django.core.exceptions import ValidationError
 from apps.enrollments.models import Enrollment, Coupon
 from django.utils import timezone  # Add this import
 
@@ -220,22 +221,52 @@ class EnrollmentAdmin(admin.ModelAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
+        """Handle enrollment validation in admin interface"""
         # If tuition_fee is empty/None, don't save it (let it be null)
         # The view layer will handle fallbacks to batch or course fee
         if form.cleaned_data.get('tuition_fee') is None:
             obj.tuition_fee = None
-        super().save_model(request, obj, form, change)
+
+        try:
+            # Attempt to save the model
+            super().save_model(request, obj, form, change)
+        except ValidationError as e:
+            # Add the validation error to the form's non-field errors
+            form.add_error(None, e.message if hasattr(e, 'message') else str(e))
+            # Display error message to the user
+            # messages.error(request, str(e))
+            # Re-raise the exception to prevent the admin from proceeding
+            # This will stop the save process and keep the user on the form page
+            raise
 
     def change_view(self, request, object_id, form_url='', extra_context=None):
         extra_context = extra_context or {}
-        enrollment = self.get_queryset(request).get(pk=object_id)
 
-        # Add custom action button for unenroll
-        if enrollment.is_active:
-            unenroll_url = reverse('admin:enrollment-unenroll', args=[object_id])
-            extra_context['unenroll_url'] = unenroll_url
+        try:
+            enrollment = self.get_queryset(request).get(pk=object_id)
 
-        return super().change_view(request, object_id, form_url, extra_context=extra_context)
+            # Add custom action button for unenroll
+            if enrollment.is_active:
+                unenroll_url = reverse('admin:enrollment-unenroll', args=[object_id])
+                extra_context['unenroll_url'] = unenroll_url
+
+            return super().change_view(request, object_id, form_url, extra_context=extra_context)
+        except ValidationError as e:
+            # Handle validation error specifically for POST requests (form submissions)
+            if request.method == 'POST':
+                messages.error(request, str(e))
+                # Get the object again
+                enrollment = self.get_queryset(request).get(pk=object_id)
+                # Redirect back to the same form
+                opts = self.model._meta
+                redirect_url = reverse(
+                    f'admin:{opts.app_label}_{opts.model_name}_change',
+                    args=(object_id,),
+                    current_app=self.admin_site.name,
+                )
+                return HttpResponseRedirect(redirect_url)
+            # Re-raise for GET requests or other cases
+            raise
 
 
 @admin.register(Coupon)
@@ -270,20 +301,21 @@ class CouponAdmin(admin.ModelAdmin):
             if discount_type in type_map:
                 types.append(type_map[discount_type])
 
-                # Add specific benefit description
-                if discount_type == 'TUITION' and obj.discount_value:
-                    benefits.append(f"<li>{obj.discount_value}% off monthly tuition fee</li>")
-                elif discount_type == 'ADMISSION':
-                    benefits.append("<li>Admission fee waived (set to ৳0.00)</li>")
-                elif discount_type == 'FIRST_MONTH':
-                    benefits.append("<li>First month tuition fee waived</li>")
+                # # Add specific benefit description
+                # if discount_type == 'TUITION' and obj.discount_value:
+                #     benefits.append(f"{obj.discount_value}% off monthly tuition fee")
+                # elif discount_type == 'ADMISSION':
+                #     benefits.append("Admission fee waived (set to ৳0.00)")
+                # elif discount_type == 'FIRST_MONTH':
+                #     benefits.append("First month tuition fee waived")
 
         # Show discount types and benefits
         if benefits:
+            benefits_html = "".join([format_html("<li>{}</li>", benefit) for benefit in benefits])
             return format_html(
                 "{}<br/><ul style='margin-top: 5px; margin-bottom: 0;'>{}</ul>",
                 ", ".join(types),
-                "".join(benefits)
+                benefits_html
             )
         return ", ".join(types)
 

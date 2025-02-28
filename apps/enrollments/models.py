@@ -1,5 +1,6 @@
 from django.db import models
 from django.db.models import Q
+from django.core.exceptions import ValidationError
 from apps.accounts.models import Student
 from apps.courses.models import Batch
 
@@ -39,6 +40,7 @@ class Enrollment(models.Model):
             course_id = self.batch.course_id
 
             # Check for other active enrollments in the same course
+            # Exclude both current enrollment ID and inactive enrollments
             existing_enrollment = Enrollment.objects.filter(
                 student=self.student,
                 batch__course_id=course_id,
@@ -46,12 +48,20 @@ class Enrollment(models.Model):
             ).exclude(pk=self.pk if self.pk else None).first()
 
             if existing_enrollment:
-                from django.core.exceptions import ValidationError
-                raise ValidationError(
-                    f"Student {self.student.name} is already enrolled in batch "
-                    f"{existing_enrollment.batch.name} of the same course. "
-                    f"A student cannot be enrolled in multiple batches of the same course simultaneously."
-                )
+                # If this is a reactivation of an existing enrollment and it conflicts
+                # with another active enrollment, inform the admin clearly
+                if self.pk:
+                    raise ValidationError(
+                        f"Cannot reactivate this enrollment because student {self.student.name} "
+                        f"is already enrolled in batch {existing_enrollment.batch.name} of "
+                        f"this course. Please deactivate the other enrollment first."
+                    )
+                else:
+                    raise ValidationError(
+                        f"Student {self.student.name} is already enrolled in batch "
+                        f"{existing_enrollment.batch.name} of the same course. "
+                        f"A student cannot be enrolled in multiple batches of the same course simultaneously."
+                    )
 
         super().save(*args, **kwargs)
 

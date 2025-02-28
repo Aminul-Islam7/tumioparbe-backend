@@ -8,7 +8,7 @@ class Invoice(models.Model):
     month = models.DateField()
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     is_paid = models.BooleanField(default=False)
-    coupon = models.ForeignKey(Coupon, null=True, on_delete=models.SET_NULL)
+    coupon = models.ForeignKey(Coupon, null=True, blank=True, on_delete=models.SET_NULL)
     temp_invoice = models.BooleanField(default=False, help_text="Whether this is a temporary invoice for enrollment")
     temp_invoice_data = JSONField(null=True, blank=True, help_text="Temporary enrollment data for webhook processing")
     created_at = models.DateTimeField(auto_now_add=True)
