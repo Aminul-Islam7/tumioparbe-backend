@@ -15,10 +15,12 @@ from django.utils.crypto import get_random_string
 from django.utils import timezone
 from django.http import HttpResponseRedirect
 from django.conf import settings
+from django.db import transaction
+from decimal import Decimal
 
 from apps.payments.models import Invoice, Payment
 from apps.enrollments.models import Enrollment, Coupon
-from apps.payments.api.serializers import PaymentSerializer, PaymentInitiateSerializer, InvoiceSerializer, ManualInvoiceCreateSerializer
+from apps.payments.api.serializers import PaymentSerializer, PaymentInitiateSerializer, InvoiceSerializer, ManualInvoiceCreateSerializer, BulkPaymentInitiateSerializer
 from services.bkash import bkash_client
 
 import logging
@@ -107,6 +109,118 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return Response({"error": "Failed to initiate bKash payment."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'])
+    def bulk_pay_invoices(self, request):
+        """
+        Pay multiple invoices at once using bKash
+        """
+        serializer = BulkPaymentInitiateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get validated data
+        invoice_ids = serializer.validated_data['invoice_ids']
+        callback_url = serializer.validated_data['callback_url']
+        customer_phone = serializer.validated_data['customer_phone']
+
+        if not invoice_ids:
+            return Response({"error": "No invoice IDs provided"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get all the invoices
+        invoices = Invoice.objects.filter(id__in=invoice_ids)
+
+        # Check if all the invoices exist
+        if invoices.count() != len(invoice_ids):
+            return Response({"error": "One or more invoices not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check if all invoices belong to the requesting user's students
+        if not request.user.is_staff:
+            unauthorized_invoices = invoices.exclude(enrollment__student__parent=request.user)
+            if unauthorized_invoices.exists():
+                return Response(
+                    {"error": "You don't have permission to pay one or more of these invoices"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Check if any invoice is already paid
+        already_paid = invoices.filter(is_paid=True)
+        if already_paid.exists():
+            paid_ids = list(already_paid.values_list('id', flat=True))
+            return Response({
+                "error": "One or more invoices are already paid",
+                "paid_invoice_ids": paid_ids
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate the total amount
+        total_amount = sum(invoice.amount for invoice in invoices)
+
+        # Generate a unique merchant invoice number
+        merchant_invoice_number = f"MULTI-{'-'.join(str(id) for id in invoice_ids)}-{get_random_string(6).upper()}"
+
+        try:
+            # Start a transaction to ensure all operations succeed or fail together
+            with transaction.atomic():
+                # Create a "parent" invoice to track the multi-invoice payment
+                parent_invoice = Invoice.objects.create(
+                    enrollment=None,  # No specific enrollment
+                    month=timezone.now().date().replace(day=1),  # First day of current month
+                    amount=total_amount,
+                    is_paid=False,
+                    temp_invoice=True,
+                    temp_invoice_data={
+                        "type": "multi_invoice_payment",
+                        "invoice_ids": invoice_ids,
+                        "payment_date": timezone.now().isoformat()
+                    }
+                )
+
+                # Call bKash API to create payment
+                payment_response = bkash_client.create_payment(
+                    amount=str(total_amount),
+                    invoice_number=merchant_invoice_number,
+                    customer_phone=customer_phone,
+                    callback_url=callback_url
+                )
+
+                if payment_response.get("statusCode") != "0000":
+                    # Transaction will be rolled back if this fails
+                    return Response({
+                        "error": "bKash payment initiation failed",
+                        "status_code": payment_response.get("statusCode"),
+                        "status_message": payment_response.get("statusMessage")
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                # Create a payment record linked to the parent invoice
+                payment = Payment.objects.create(
+                    invoice=parent_invoice,
+                    transaction_id=merchant_invoice_number,
+                    amount=total_amount,
+                    payment_method='bKash',
+                    status=Payment.INITIATED,
+                    payment_id=payment_response.get('paymentID'),
+                    payer_reference=customer_phone,
+                    payment_create_time=timezone.now()
+                )
+
+                # Return the bKash URL for redirecting the user
+                return Response({
+                    "payment_id": payment.id,
+                    "bkash_payment_id": payment_response.get('paymentID'),
+                    "bkash_url": payment_response.get('bkashURL'),
+                    "total_amount": str(total_amount),
+                    "invoice_count": len(invoice_ids),
+                    "callback_urls": {
+                        "success": payment_response.get('successCallbackURL'),
+                        "failure": payment_response.get('failureCallbackURL'),
+                        "cancelled": payment_response.get('cancelledCallbackURL')
+                    }
+                })
+
+        except Exception as e:
+            logger.error(f"Error initiating bulk bKash payment: {str(e)}")
+            return Response({"error": f"Failed to initiate bulk payment: {str(e)}"},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'])
     def execute_bkash_payment(self, request):
         """
         Execute a bKash payment after user has authorized it and create enrollment if needed
@@ -143,43 +257,97 @@ class PaymentViewSet(viewsets.ModelViewSet):
                         # Use a database transaction to ensure atomicity
                         from django.db import transaction
                         with transaction.atomic():
-                            # Complete the enrollment using the stored data
-                            from apps.enrollments.api.views import EnrollmentViewSet
+                            # Check if this is a multi-invoice payment
+                            if (invoice.temp_invoice_data.get('type') == 'multi_invoice_payment' and
+                                    'invoice_ids' in invoice.temp_invoice_data):
+                                # Process each invoice in the bulk payment
+                                invoice_ids = invoice.temp_invoice_data['invoice_ids']
+                                processed_invoices = []
 
-                            viewset = EnrollmentViewSet()
-                            enrollment_data = invoice.temp_invoice_data
+                                # Mark all individual invoices as paid and create payment records
+                                for inv_id in invoice_ids:
+                                    try:
+                                        individual_invoice = Invoice.objects.get(id=inv_id)
+                                        individual_invoice.is_paid = True
+                                        individual_invoice.save()
 
-                            # Create a proper request object
-                            from rest_framework.test import APIRequestFactory
-                            from rest_framework.request import Request
+                                        # Create a derived but unique transaction ID for each individual invoice
+                                        # Format: original_trx_id-invoice_id
+                                        unique_transaction_id = f"{payment.transaction_id}-{individual_invoice.id}"
 
-                            factory = APIRequestFactory()
-                            api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
-                            api_request.data = {
-                                'bkash_payment_id': payment_id,
-                                'enrollment_data': enrollment_data,
-                                'temp_invoice_id': invoice.id
-                            }
-                            api_request.user = request.user
-                            viewset.request = Request(api_request)
+                                        # Create individual payment record linked to this invoice
+                                        individual_payment = Payment.objects.create(
+                                            invoice=individual_invoice,
+                                            transaction_id=unique_transaction_id,  # Use derived unique transaction ID
+                                            amount=individual_invoice.amount,
+                                            payment_method='bKash',
+                                            status=Payment.COMPLETED,
+                                            payment_id=payment.payment_id,  # Reference the same bKash payment
+                                            payer_reference=payment.payer_reference,
+                                            payment_create_time=payment.payment_create_time,
+                                            payment_execute_time=payment.payment_execute_time
+                                        )
 
-                            # Complete the enrollment
-                            enrollment_response = viewset.verify_and_complete_payment(api_request)
+                                        processed_invoices.append(inv_id)
+                                        logger.info(f"Marked invoice #{inv_id} as paid and created payment record in bulk payment {payment_id}")
+                                    except Invoice.DoesNotExist:
+                                        logger.error(f"Invoice #{inv_id} not found in bulk payment {payment_id}")
 
-                            if enrollment_response.status_code not in [200, 201]:
-                                # If enrollment creation fails, roll back the transaction
-                                raise Exception(f"Enrollment creation failed: {enrollment_response.data}")
+                                # Delete the temporary invoice and its payment as they're no longer needed
+                                temp_invoice_id = invoice.id
+                                payment_id_to_return = payment.payment_id
+                                trx_id_to_return = payment.transaction_id
+                                payment.delete()
+                                invoice.delete()
 
-                            # Add enrollment info to the response
-                            enrollment_info = enrollment_response.data.get('enrollment', {})
+                                logger.info(f"Temporary invoice #{temp_invoice_id} and its payment deleted after distributing payments to individual invoices")
 
-                            return Response({
-                                "status": "success",
-                                "transaction_id": payment.transaction_id,
-                                "payment_status": payment.status,
-                                "message": "Payment completed and enrollment created successfully.",
-                                "enrollment": enrollment_info
-                            })
+                                return Response({
+                                    "status": "success",
+                                    "transaction_id": trx_id_to_return,
+                                    "payment_status": Payment.COMPLETED,
+                                    "message": f"Bulk payment completed successfully. {len(processed_invoices)} invoices marked as paid.",
+                                    "processed_invoices": processed_invoices
+                                })
+                            else:
+                                # Regular enrollment payment
+                                # Complete the enrollment using the stored data
+                                from apps.enrollments.api.views import EnrollmentViewSet
+
+                                viewset = EnrollmentViewSet()
+                                enrollment_data = invoice.temp_invoice_data
+
+                                # Create a proper request object
+                                from rest_framework.test import APIRequestFactory
+                                from rest_framework.request import Request
+
+                                factory = APIRequestFactory()
+                                api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
+                                api_request.data = {
+                                    'bkash_payment_id': payment_id,
+                                    'enrollment_data': enrollment_data,
+                                    'temp_invoice_id': invoice.id
+                                }
+                                api_request.user = request.user
+                                viewset.request = Request(api_request)
+
+                                # Complete the enrollment
+                                enrollment_response = viewset.verify_and_complete_payment(api_request)
+
+                                if enrollment_response.status_code not in [200, 201]:
+                                    # If enrollment creation fails, roll back the transaction
+                                    raise Exception(f"Enrollment creation failed: {enrollment_response.data}")
+
+                                # Add enrollment info to the response
+                                enrollment_info = enrollment_response.data.get('enrollment', {})
+
+                                return Response({
+                                    "status": "success",
+                                    "transaction_id": payment.transaction_id,
+                                    "payment_status": payment.status,
+                                    "message": "Payment completed and enrollment created successfully.",
+                                    "enrollment": enrollment_info
+                                })
                     except Exception as e:
                         logger.error(f"Error creating enrollment after payment: {str(e)}")
                         # Since we're using atomic transaction, both payment execution and enrollment
@@ -580,8 +748,52 @@ class BkashWebhookView(APIView):
             invoice.is_paid = True
             invoice.save()
 
+            # Check if this is a bulk payment (multi-invoice payment)
+            if invoice.temp_invoice and invoice.temp_invoice_data and invoice.temp_invoice_data.get('type') == 'multi_invoice_payment':
+                try:
+                    with transaction.atomic():
+                        invoice_ids = invoice.temp_invoice_data.get('invoice_ids', [])
+
+                        # Process each invoice in the bulk payment
+                        for inv_id in invoice_ids:
+                            try:
+                                individual_invoice = Invoice.objects.get(id=inv_id)
+                                individual_invoice.is_paid = True
+                                individual_invoice.save()
+
+                                # Create a derived but unique transaction ID for each individual invoice
+                                # Format: original_trx_id-invoice_id
+                                unique_transaction_id = f"{trx_id}-{individual_invoice.id}"
+
+                                # Create individual payment record linked to this invoice
+                                individual_payment = Payment.objects.create(
+                                    invoice=individual_invoice,
+                                    transaction_id=unique_transaction_id,  # Use derived unique transaction ID
+                                    amount=individual_invoice.amount,
+                                    payment_method='bKash',
+                                    status=Payment.COMPLETED,
+                                    payment_id=payment_id,  # Reference the same bKash payment
+                                    payer_reference=payment.payer_reference,
+                                    payment_create_time=payment.payment_create_time,
+                                    payment_execute_time=payment.payment_execute_time
+                                )
+
+                                logger.info(f"Webhook: Marked invoice #{inv_id} as paid and created payment record for bulk payment {payment_id}")
+                            except Invoice.DoesNotExist:
+                                logger.error(f"Webhook: Invoice #{inv_id} not found in bulk payment {payment_id}")
+
+                        # Delete the temporary invoice and its payment as they're no longer needed
+                        temp_invoice_id = invoice.id
+                        payment.delete()
+                        invoice.delete()
+
+                        logger.info(f"Webhook: Temporary invoice #{temp_invoice_id} and its payment deleted after distributing payments")
+                        return True
+                except Exception as e:
+                    logger.error(f"Webhook: Error processing bulk payment: {str(e)}")
+                    # Don't return False here, the payment was still recorded
             # If this is an enrollment payment (no enrollment yet), complete the enrollment
-            if not invoice.enrollment and invoice.temp_invoice:
+            elif not invoice.enrollment and invoice.temp_invoice:
                 try:
                     # Get enrollment data from temporary invoice
                     enrollment_data = invoice.temp_invoice_data

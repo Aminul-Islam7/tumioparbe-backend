@@ -2,7 +2,9 @@ import logging
 from datetime import datetime, timedelta, date
 from calendar import monthrange
 from typing import List, Dict, Any
-from django.db.models import Q
+from django.db.models import Q, Sum
+from django.db.models.functions import TruncMonth
+from collections import defaultdict
 from celery import shared_task
 from django.conf import settings
 from django.db import transaction
@@ -11,7 +13,7 @@ from django.utils import timezone
 from apps.enrollments.models import Enrollment
 from apps.payments.models import Invoice
 from apps.common.models import SystemSettings, ActivityLog
-from services.sms.client import send_payment_reminder
+from services.sms.client import send_payment_reminder, send_enhanced_payment_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,7 @@ def send_payment_reminders():
     """
     Send SMS reminders for pending payments.
     This task should run daily and check if reminders should be sent today.
+    Groups unpaid invoices by student and includes all previous due months.
     """
     today = timezone.localdate()
     current_day = today.day
@@ -157,10 +160,11 @@ def send_payment_reminders():
 
     logger.info(f"[{today}] Starting payment reminder sending for day {current_day} of month")
 
-    # Get all unpaid invoices for the current month
+    # Get all unpaid invoices for the current month or earlier (don't include future months)
     unpaid_invoices = Invoice.objects.filter(
         is_paid=False,
-        month__lte=today  # Only include invoices for current month or earlier
+        month__lte=today,  # Only include invoices for current month or earlier
+        enrollment__isnull=False  # Exclude temporary invoices
     ).select_related(
         'enrollment',
         'enrollment__student',
@@ -177,35 +181,52 @@ def send_payment_reminders():
             "date": today.isoformat()
         }
 
-    # Send reminder for each unpaid invoice
+    # Group invoices by student and parent
+    # This allows us to send one SMS per student with all their due months
+    student_invoices = defaultdict(list)  # student_id -> list of invoices
+
+    for invoice in unpaid_invoices:
+        student = invoice.enrollment.student
+        student_invoices[student.id].append(invoice)
+
+    # Send reminder for each student with unpaid invoices
     sent_count = 0
     error_count = 0
     errors = []
 
-    for invoice in unpaid_invoices:
+    # Process each student
+    for student_id, invoices in student_invoices.items():
         try:
-            # Get parent phone number
-            parent = invoice.enrollment.student.parent
+            # Get the first invoice to extract student/parent info (all invoices are for the same student)
+            first_invoice = invoices[0]
+            student = first_invoice.enrollment.student
+            parent = student.parent
             phone_number = parent.phone
 
             if not phone_number:
-                logger.warning(f"No phone number found for parent of student #{invoice.enrollment.student.id}")
+                logger.warning(f"No phone number found for parent of student #{student_id}")
                 continue
 
-            # Get student, course, and batch information
-            student_name = invoice.enrollment.student.name
-            course_name = invoice.enrollment.batch.course.name
-            batch_name = invoice.enrollment.batch.name
-            month_str = invoice.month.strftime("%B %Y")
-            amount = invoice.amount
+            # Sort invoices by month to ensure correct ordering
+            invoices = sorted(invoices, key=lambda inv: inv.month)
 
-            # Send the reminder SMS
-            result = send_payment_reminder(
+            # Extract course info from most recent invoice
+            course_name = invoices[-1].enrollment.batch.course.name
+
+            # Calculate total due amount
+            total_due = sum(invoice.amount for invoice in invoices)
+
+            # Extract month names for the message
+            due_months = [invoice.month.strftime("%B %Y") for invoice in invoices]
+
+            # Send the enhanced reminder SMS with all due months
+            result = send_enhanced_payment_reminder(
                 phone_number=phone_number,
-                student_name=student_name,
+                student_name=student.name,
                 course_name=course_name,
-                month=month_str,
-                amount=amount
+                due_months=due_months,
+                total_due=total_due,
+                user=None  # System-generated
             )
 
             if result.get("success"):
@@ -214,36 +235,37 @@ def send_payment_reminders():
                     user=parent,
                     action_type='REMINDER_SENT',
                     metadata={
-                        "invoice_id": invoice.id,
-                        "student_name": student_name,
+                        "student_id": student.id,
+                        "student_name": student.name,
                         "course_name": course_name,
-                        "month": month_str,
-                        "amount": float(amount),
-                        "reminder_day": current_day
+                        "due_months": due_months,
+                        "total_due": float(total_due),
+                        "reminder_day": current_day,
+                        "invoice_count": len(invoices)
                     }
                 )
 
                 sent_count += 1
-                logger.info(f"Payment reminder sent to {phone_number} for invoice #{invoice.id}")
+                logger.info(f"Enhanced payment reminder sent to {phone_number} for student {student.name} with {len(invoices)} due months")
             else:
-                logger.error(f"Failed to send payment reminder for invoice #{invoice.id}: {result.get('message')}")
+                logger.error(f"Failed to send payment reminder for student #{student_id}: {result.get('message')}")
                 errors.append({
-                    "invoice_id": invoice.id,
-                    "student_name": student_name,
+                    "student_id": student_id,
+                    "student_name": student.name,
                     "parent_phone": phone_number,
                     "error": result.get("message")
                 })
                 error_count += 1
 
         except Exception as e:
-            logger.error(f"Error sending payment reminder for invoice #{invoice.id}: {str(e)}")
+            logger.error(f"Error sending payment reminder for student #{student_id}: {str(e)}")
             errors.append({
-                "invoice_id": invoice.id,
+                "student_id": student_id,
                 "error": str(e)
             })
             error_count += 1
 
-    logger.info(f"Payment reminder sending completed: {sent_count} sent, {error_count} errors")
+    logger.info(f"Enhanced payment reminder sending completed: {sent_count} students notified, {error_count} errors")
 
     return {
         "status": "completed",

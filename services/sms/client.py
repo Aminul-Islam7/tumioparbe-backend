@@ -308,8 +308,40 @@ def send_payment_reminder(phone_number: str, student_name: str, course_name: str
     from apps.common.models import SMSLog
 
     # Message content
-    message = (f"Payment reminder for {student_name}'s {course_name} course. "
-               f"Amount {amount} Tk for {month} is due. Please pay to avoid interruption.")
+    message = (f"{student_name}-এর {month} মাসের ফি বাকি আছে।\n\nঅনুগ্রহ করে প্রতি মাসের ৭ তারিখের মধ্যে পরিশোধ করুণ।\n\nধন্যবাদ,\nতুমিও পারবে")
+
+    # Send the message
+    return sms_client.send_sms(phone_number, message, message_type=SMSLog.PAYMENT_REMINDER, user=user)
+
+
+def send_enhanced_payment_reminder(phone_number: str, student_name: str, course_name: str,
+                                   due_months: List[str], total_due: float, user=None) -> Dict[str, Any]:
+    """
+    Send payment reminder with multiple due months to a phone number
+
+    Args:
+        phone_number (str): The recipient's phone number
+        student_name (str): Name of the student
+        course_name (str): Name of the course
+        due_months (list): List of months for which payment is due
+        total_due (float): Total amount due
+        user: User sending the reminder
+
+    Returns:
+        dict: Response details including success status
+    """
+    from apps.common.models import SMSLog
+
+    # Format the list of months
+    if len(due_months) == 1:
+        months_text = due_months[0]
+    elif len(due_months) == 2:
+        months_text = f"{due_months[0]} and {due_months[1]}"
+    else:
+        months_text = ", ".join(due_months[:-1]) + f", and {due_months[-1]}"
+
+    # Message content
+    message = (f"{student_name}-এর {months_text} মাসের ফি বাকি আছে।\n\nঅনুগ্রহ করে প্রতি মাসের ৭ তারিখের মধ্যে পরিশোধ করুণ।\n\nধন্যবাদ,\nতুমিও পারবে")
 
     # Send the message
     return sms_client.send_sms(phone_number, message, message_type=SMSLog.PAYMENT_REMINDER, user=user)

@@ -11,6 +11,16 @@ class PaymentInitiateSerializer(serializers.Serializer):
     customer_phone = serializers.CharField(max_length=20)
 
 
+class BulkPaymentInitiateSerializer(serializers.Serializer):
+    invoice_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        min_length=1,
+        help_text="List of invoice IDs to pay together"
+    )
+    callback_url = serializers.URLField()
+    customer_phone = serializers.CharField(max_length=20)
+
+
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
