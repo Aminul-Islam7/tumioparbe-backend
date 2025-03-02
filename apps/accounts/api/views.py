@@ -57,6 +57,13 @@ def request_otp(request):
             'message': 'Invalid phone number format. Must be a valid Bangladesh number (e.g., 01841257770).'
         }, status=status.HTTP_400_BAD_REQUEST)
 
+    # Check if user already exists with this phone number
+    if User.objects.filter(phone=phone).exists():
+        return Response({
+            'success': False,
+            'message': 'An account with this phone number already exists. Please login instead.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
     # Check rate limiting (prevent OTP flooding)
     last_request_time = cache.get(f"last_otp_request:{phone}")
     current_time = int(time.time())
