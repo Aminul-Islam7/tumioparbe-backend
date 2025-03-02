@@ -1,6 +1,7 @@
 from django.db import models
 from django.db.models import JSONField
 from apps.enrollments.models import Enrollment, Coupon
+from simple_history.models import HistoricalRecords
 
 
 class Invoice(models.Model):
@@ -13,6 +14,7 @@ class Invoice(models.Model):
     temp_invoice_data = JSONField(null=True, blank=True, help_text="Temporary enrollment data for webhook processing")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords()  # Add history tracking
 
     class Meta:
         db_table = 'invoices'
@@ -48,6 +50,7 @@ class Payment(models.Model):
     updated_at = models.DateTimeField(auto_now_add=True)
     payment_create_time = models.DateTimeField(null=True, blank=True)
     payment_execute_time = models.DateTimeField(null=True, blank=True)
+    history = HistoricalRecords()  # Add history tracking
 
     def __str__(self):
         return f"{self.transaction_id} ({self.status})"

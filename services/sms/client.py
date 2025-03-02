@@ -336,9 +336,9 @@ def send_enhanced_payment_reminder(phone_number: str, student_name: str, course_
     if len(due_months) == 1:
         months_text = due_months[0]
     elif len(due_months) == 2:
-        months_text = f"{due_months[0]} and {due_months[1]}"
+        months_text = f"{due_months[0]} ও {due_months[1]}"
     else:
-        months_text = ", ".join(due_months[:-1]) + f", and {due_months[-1]}"
+        months_text = ", ".join(due_months[:-1]) + f" ও {due_months[-1]}"
 
     # Message content
     message = (f"{student_name}-এর {months_text} মাসের ফি বাকি আছে।\n\nঅনুগ্রহ করে প্রতি মাসের ৭ তারিখের মধ্যে পরিশোধ করুণ।\n\nধন্যবাদ,\nতুমিও পারবে")

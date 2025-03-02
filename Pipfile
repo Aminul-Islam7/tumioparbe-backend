@@ -18,6 +18,7 @@ django-extensions = "*"
 python-dotenv = "*"
 django-celery-results = "*"
 django-celery-beat = "*"
+django-simple-history = "*"
 
 [dev-packages]
 

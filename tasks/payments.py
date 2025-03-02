@@ -12,8 +12,9 @@ from django.utils import timezone
 
 from apps.enrollments.models import Enrollment
 from apps.payments.models import Invoice
-from apps.common.models import SystemSettings, ActivityLog
-from services.sms.client import send_payment_reminder, send_enhanced_payment_reminder
+from apps.common.models import SystemSettings
+from services.sms.client import send_enhanced_payment_reminder, sms_client
+from apps.common.models import SMSLog
 
 logger = logging.getLogger(__name__)
 
@@ -21,256 +22,182 @@ logger = logging.getLogger(__name__)
 @shared_task
 def generate_monthly_invoices():
     """
-    Generate monthly invoices for active enrollments.
-    This task should be scheduled to run a few days before the end of each month.
+    Generate invoices for the next month for all active enrollments
+    Should run a few days before the end of the month
     """
-    today = timezone.localdate()
+    # Only proceed if auto-generate is enabled in settings
+    settings = SystemSettings.get_settings()
+    if not settings.is_auto_generate_invoices():
+        logger.info("Auto-generate invoices is disabled in system settings. Skipping invoice generation.")
+        return
 
-    # Check if auto-generation is enabled
-    if not SystemSettings.is_auto_generate_invoices():
-        logger.info(f"[{today}] Automatic invoice generation is disabled. Skipping.")
-        return {
-            "status": "skipped",
-            "reason": "Auto-generation disabled",
-            "date": today.isoformat()
-        }
-
-    days_before = SystemSettings.get_invoice_generation_days()
-
-    # Calculate the last day of the current month
-    _, last_day = monthrange(today.year, today.month)
-    end_of_month = date(today.year, today.month, last_day)
-
-    # Check if today is within the days_before window
-    if (end_of_month - today).days > days_before:
-        logger.info(f"[{today}] Not within {days_before} days before end of month. Skipping invoice generation.")
-        return {
-            "status": "skipped",
-            "reason": f"Not within {days_before} days of month end",
-            "date": today.isoformat()
-        }
-
-    # Determine the next month (for which we're generating invoices)
+    today = timezone.now().date()
+    # Get the first day of next month
     if today.month == 12:
         next_month = date(today.year + 1, 1, 1)
     else:
         next_month = date(today.year, today.month + 1, 1)
 
-    logger.info(f"[{today}] Starting automatic invoice generation for {next_month.strftime('%B %Y')}")
+    logger.info(f"Generating invoices for {next_month.strftime('%B %Y')}")
 
     # Get all active enrollments
-    active_enrollments = Enrollment.objects.filter(
-        is_active=True,
-        enrollment_date__lt=next_month  # Only include enrollments before next month
-    )
+    enrollments = Enrollment.objects.filter(is_active=True)
 
-    if not active_enrollments.exists():
-        logger.info(f"No active enrollments found for invoice generation")
-        return {
-            "status": "completed",
-            "invoices_generated": 0,
-            "date": today.isoformat()
-        }
+    invoice_count = 0
+    for enrollment in enrollments:
+        # Check if an invoice for this month already exists
+        existing_invoice = Invoice.objects.filter(
+            enrollment=enrollment,
+            month=next_month
+        ).exists()
 
-    # Create new invoices for each active enrollment
-    created_count = 0
-    error_count = 0
-    errors = []
-
-    for enrollment in active_enrollments:
-        try:
-            # Check if invoice already exists for the enrollment and next month
-            existing_invoice = Invoice.objects.filter(
-                enrollment=enrollment,
-                month=next_month
-            ).exists()
-
-            if existing_invoice:
-                logger.debug(f"Invoice already exists for enrollment #{enrollment.id} for {next_month.strftime('%B %Y')}")
-                continue
-
-            # Get the fee (use override if exists, otherwise batch fee, otherwise course fee)
-            if enrollment.fee_override is not None:
-                fee = enrollment.fee_override
-            elif enrollment.batch.fee_override is not None:
-                fee = enrollment.batch.fee_override
+        if not existing_invoice:
+            # Get the appropriate fee for this enrollment
+            # First check if there's a student-specific override
+            if enrollment.tuition_fee is not None:
+                fee = enrollment.tuition_fee
+            # Then check if there's a batch-specific fee
+            elif enrollment.batch.tuition_fee is not None:
+                fee = enrollment.batch.tuition_fee
+            # Finally fall back to course's monthly fee
             else:
-                fee = enrollment.batch.course.tuition_fee
+                fee = enrollment.batch.course.monthly_fee
 
-            # Create the invoice (unpaid by default)
-            invoice = Invoice.objects.create(
+            # Create the invoice
+            Invoice.objects.create(
                 enrollment=enrollment,
                 month=next_month,
                 amount=fee,
                 is_paid=False
             )
+            invoice_count += 1
 
-            logger.info(f"Created invoice #{invoice.id} for {enrollment.student.name} - {next_month.strftime('%B %Y')} - {fee}")
-            created_count += 1
-
-        except Exception as e:
-            logger.error(f"Error creating invoice for enrollment #{enrollment.id}: {str(e)}")
-            errors.append({
-                "enrollment_id": enrollment.id,
-                "student_name": enrollment.student.name,
-                "error": str(e)
-            })
-            error_count += 1
-
-    logger.info(f"Automatic invoice generation completed: {created_count} created, {error_count} errors")
-
-    return {
-        "status": "completed",
-        "invoices_generated": created_count,
-        "errors": error_count,
-        "error_details": errors if errors else None,
-        "date": today.isoformat()
-    }
+    logger.info(f"Generated {invoice_count} invoices for {next_month.strftime('%B %Y')}")
+    return invoice_count
 
 
 @shared_task
 def send_payment_reminders():
     """
-    Send SMS reminders for pending payments.
-    This task should run daily and check if reminders should be sent today.
-    Groups unpaid invoices by student and includes all previous due months.
+    Send SMS reminders for unpaid invoices
+    Should run on specific days of the month (e.g., 3rd and 7th)
     """
-    today = timezone.localdate()
-    current_day = today.day
+    # Only proceed if auto-reminders are enabled in settings
+    settings = SystemSettings.get_settings()
+    if not settings.is_auto_send_reminders():
+        logger.info("Auto-send reminders is disabled in system settings. Skipping reminder sending.")
+        return
 
-    # Check if today is a reminder day based on settings
+    # Check if today is a reminder day (e.g., 3rd or 7th of the month)
+    today = timezone.now().date()
+    day_of_month = today.day
     reminder_days = SystemSettings.get_reminder_days()
 
-    # Check if auto-reminders are enabled
-    if not SystemSettings.is_auto_send_reminders():
-        logger.info(f"[{today}] Automatic payment reminders are disabled. Skipping.")
-        return {
-            "status": "skipped",
-            "reason": "Auto-reminders disabled",
-            "date": today.isoformat()
-        }
+    if day_of_month not in reminder_days:
+        logger.info(f"Today ({day_of_month}) is not a reminder day {reminder_days}. Skipping.")
+        return
 
-    if current_day not in reminder_days:
-        logger.info(f"[{today}] Not a configured reminder day. Skipping reminder sending.")
-        return {
-            "status": "skipped",
-            "reason": f"Day {current_day} not in reminder days {reminder_days}",
-            "date": today.isoformat()
-        }
-
-    logger.info(f"[{today}] Starting payment reminder sending for day {current_day} of month")
-
-    # Get all unpaid invoices for the current month or earlier (don't include future months)
+    # Get all unpaid invoices for the current month or earlier
+    current_month = date(today.year, today.month, 1)
     unpaid_invoices = Invoice.objects.filter(
+        month__lte=current_month,  # Current month or earlier
         is_paid=False,
-        month__lte=today,  # Only include invoices for current month or earlier
-        enrollment__isnull=False  # Exclude temporary invoices
+        enrollment__is_active=True  # Only for active enrollments
     ).select_related(
-        'enrollment',
-        'enrollment__student',
         'enrollment__student__parent',
-        'enrollment__batch',
         'enrollment__batch__course'
     )
 
-    if not unpaid_invoices.exists():
-        logger.info(f"No unpaid invoices found for reminder sending")
-        return {
-            "status": "completed",
-            "reminders_sent": 0,
-            "date": today.isoformat()
-        }
-
-    # Group invoices by student and parent
-    # This allows us to send one SMS per student with all their due months
-    student_invoices = defaultdict(list)  # student_id -> list of invoices
-
+    # Group invoices by parent to avoid sending multiple SMS to the same parent
+    parent_invoices = {}
     for invoice in unpaid_invoices:
+        parent = invoice.enrollment.student.parent
+        if parent.phone not in parent_invoices:
+            parent_invoices[parent.phone] = {
+                'parent': parent,
+                'students': {},
+                'total_due': 0
+            }
+
         student = invoice.enrollment.student
-        student_invoices[student.id].append(invoice)
+        if student.id not in parent_invoices[parent.phone]['students']:
+            parent_invoices[parent.phone]['students'][student.id] = {
+                'name': student.name,
+                'courses': [],
+                'months': [],
+                'due': 0
+            }
 
-    # Send reminder for each student with unpaid invoices
-    sent_count = 0
-    error_count = 0
-    errors = []
+        # Add course info and month info and amount
+        course_name = invoice.enrollment.batch.course.name
+        month_name = invoice.month.strftime('%B %Y')
 
-    # Process each student
-    for student_id, invoices in student_invoices.items():
-        try:
-            # Get the first invoice to extract student/parent info (all invoices are for the same student)
-            first_invoice = invoices[0]
-            student = first_invoice.enrollment.student
-            parent = student.parent
-            phone_number = parent.phone
+        parent_invoices[parent.phone]['students'][student.id]['courses'].append(course_name)
+        parent_invoices[parent.phone]['students'][student.id]['months'].append(month_name)
+        parent_invoices[parent.phone]['students'][student.id]['due'] += invoice.amount
+        parent_invoices[parent.phone]['total_due'] += invoice.amount
 
-            if not phone_number:
-                logger.warning(f"No phone number found for parent of student #{student_id}")
-                continue
+    # Send SMS to each parent
+    message_count = 0
+    for phone, data in parent_invoices.items():
+        parent = data['parent']
+        total_due = data['total_due']
 
-            # Sort invoices by month to ensure correct ordering
-            invoices = sorted(invoices, key=lambda inv: inv.month)
+        # For single student case
+        if len(data['students']) == 1:
+            student_data = list(data['students'].values())[0]
+            student_name = student_data['name']
+            courses = ', '.join(set(student_data['courses']))
+            due_months = list(set(student_data['months']))
 
-            # Extract course info from most recent invoice
-            course_name = invoices[-1].enrollment.batch.course.name
-
-            # Calculate total due amount
-            total_due = sum(invoice.amount for invoice in invoices)
-
-            # Extract month names for the message
-            due_months = [invoice.month.strftime("%B %Y") for invoice in invoices]
-
-            # Send the enhanced reminder SMS with all due months
-            result = send_enhanced_payment_reminder(
-                phone_number=phone_number,
-                student_name=student.name,
-                course_name=course_name,
-                due_months=due_months,
-                total_due=total_due,
-                user=None  # System-generated
-            )
-
-            if result.get("success"):
-                # Log the activity
-                ActivityLog.objects.create(
-                    user=parent,
-                    action_type='REMINDER_SENT',
-                    metadata={
-                        "student_id": student.id,
-                        "student_name": student.name,
-                        "course_name": course_name,
-                        "due_months": due_months,
-                        "total_due": float(total_due),
-                        "reminder_day": current_day,
-                        "invoice_count": len(invoices)
-                    }
+            # Send the SMS using the enhanced payment reminder function
+            try:
+                sms_result = send_enhanced_payment_reminder(
+                    phone_number=phone,
+                    student_name=student_name,
+                    course_name=courses,
+                    due_months=due_months,
+                    total_due=total_due,
+                    user=None  # System generated
                 )
 
-                sent_count += 1
-                logger.info(f"Enhanced payment reminder sent to {phone_number} for student {student.name} with {len(invoices)} due months")
-            else:
-                logger.error(f"Failed to send payment reminder for student #{student_id}: {result.get('message')}")
-                errors.append({
-                    "student_id": student_id,
-                    "student_name": student.name,
-                    "parent_phone": phone_number,
-                    "error": result.get("message")
-                })
-                error_count += 1
+                if sms_result.get('success'):
+                    message_count += 1
+                    logger.info(f"Payment reminder sent to {phone} for student {student_name}")
+                else:
+                    logger.error(f"Failed to send payment reminder to {phone}: {sms_result.get('message')}")
 
-        except Exception as e:
-            logger.error(f"Error sending payment reminder for student #{student_id}: {str(e)}")
-            errors.append({
-                "student_id": student_id,
-                "error": str(e)
-            })
-            error_count += 1
+            except Exception as e:
+                logger.error(f"Error sending payment reminder to {phone}: {str(e)}")
+        else:
+            # For multiple students - combine their months into one list
+            all_due_months = set()
+            for student_data in data['students'].values():
+                all_due_months.update(set(student_data['months']))
 
-    logger.info(f"Enhanced payment reminder sending completed: {sent_count} students notified, {error_count} errors")
+            # Format in a way that's suitable for the enhanced payment reminder
+            # Create a comma-separated list of student names
+            student_names = ", ".join([data['name'] for _, data in data['students'].items()])
 
-    return {
-        "status": "completed",
-        "reminders_sent": sent_count,
-        "errors": error_count,
-        "error_details": errors if errors else None,
-        "date": today.isoformat()
-    }
+            # Use the same messaging service but with combined student names
+            try:
+                sms_result = send_enhanced_payment_reminder(
+                    phone_number=phone,
+                    student_name=student_names,  # All student names combined
+                    course_name="multiple courses",  # Generic text
+                    due_months=list(all_due_months),
+                    total_due=total_due,
+                    user=None  # System generated
+                )
+
+                if sms_result.get('success'):
+                    message_count += 1
+                    logger.info(f"Payment reminder sent to {phone} for {len(data['students'])} students")
+                else:
+                    logger.error(f"Failed to send payment reminder to {phone}: {sms_result.get('message')}")
+
+            except Exception as e:
+                logger.error(f"Error sending payment reminder to {phone}: {str(e)}")
+
+    logger.info(f"Sent {message_count} payment reminders out of {len(parent_invoices)} parents")
+    return message_count

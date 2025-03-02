@@ -15,6 +15,7 @@ from apps.accounts.models import Student
 from apps.courses.models import Batch, Course
 from apps.payments.models import Invoice, Payment
 from services.bkash import bkash_client
+from apps.common.utils import log_activity
 
 import logging
 
@@ -386,7 +387,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         }, status=status.HTTP_400_BAD_REQUEST)
 
                     # Create payment record
-                    payment = Payment.objects.create(
+                    Payment.objects.create(
                         invoice=temp_invoice,
                         transaction_id=merchant_invoice_number,
                         amount=total_amount,
@@ -398,9 +399,8 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     )
 
                     return Response({
-                        "payment_id": payment.id,
-                        "temp_invoice_id": temp_invoice.id,
-                        "bkash_payment_id": payment_response.get('paymentID'),
+                        "temp_invoice_id": temp_invoice.id,  # Added temp_invoice_id to the response
+                        "payment_id": payment_response.get('paymentID'),
                         "bkash_url": payment_response.get('bkashURL'),
                         "total_amount": str(total_amount),
                         "first_month_waiver": first_month_waiver,
@@ -672,6 +672,24 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 except Exception as e:
                     logger.error(f"Error creating third month invoice: {str(e)}")
                     # Continue even if third month invoice creation fails
+
+            # Log the enrollment activity
+            log_activity(
+                user=request.user,
+                action_type='ENROLLMENT',
+                enrollment_id=enrollment.id,
+                student_id=enrollment.student.id,
+                student_name=enrollment.student.name,
+                course=course.name,
+                batch=batch.name,
+                start_month=first_month.strftime('%B %Y'),
+                tuition_fee=str(tuition_fee),
+                coupon_code=coupon_code if coupon_code else None,
+                has_first_month_waiver=first_month_waiver,
+                payment_id=payment.id if 'payment' in locals() else None,
+                transaction_id=payment.transaction_id if 'payment' in locals() else None,
+                payment_method=payment.payment_method if 'payment' in locals() else None
+            )
 
             response_data = {
                 "enrollment": serializer.data,
@@ -964,6 +982,26 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                             logger.error(f"Error creating third month invoice: {str(e)}")
                             # Continue even if third month invoice creation fails
 
+                    # Log the enrollment recovery activity
+                    log_activity(
+                        user=request.user,
+                        action_type='ENROLLMENT',
+                        enrollment_id=enrollment.id,
+                        student_id=enrollment.student.id,
+                        student_name=enrollment.student.name,
+                        course=batch.course.name,
+                        batch=batch.name,
+                        start_month=first_month.strftime('%B %Y'),
+                        tuition_fee=str(tuition_fee),
+                        coupon_code=coupon_code if coupon_code else None,
+                        has_first_month_waiver=first_month_waiver,
+                        is_recovery=True,
+                        payment_id=payment.id if 'payment' in locals() else None,
+                        transaction_id=payment.transaction_id if 'payment' in locals() else None,
+                        payment_method="bKash",
+                        recovery_method="verify_and_complete"
+                    )
+
                     # Return success response
                     response_data = {
                         "message": "Enrollment recovery completed successfully",
@@ -997,6 +1035,85 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
+    def transfer_batch(self, request, pk=None):
+        """
+        Transfer a student from one batch to another
+        Preserves enrollment history while moving the student to a new batch
+        """
+        try:
+            # Get current enrollment
+            current_enrollment = self.get_object()
+
+            # Get target batch ID from request data
+            target_batch_id = request.data.get('batch_id')
+            if not target_batch_id:
+                return Response({
+                    "error": "Target batch ID is required"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Get target batch
+            try:
+                target_batch = Batch.objects.get(id=target_batch_id)
+            except Batch.DoesNotExist:
+                return Response({
+                    "error": f"Batch with ID {target_batch_id} not found"
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            # Check if target batch is from the same course
+            if current_enrollment.batch.course.id != target_batch.course.id:
+                return Response({
+                    "error": "Cannot transfer to a batch from a different course. Please unenroll and create a new enrollment instead."
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Check if student is already enrolled in the target batch
+            if Enrollment.objects.filter(
+                student=current_enrollment.student,
+                batch=target_batch,
+                is_active=True
+            ).exists():
+                return Response({
+                    "error": f"Student is already enrolled in the target batch"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Store information for logging
+            old_batch_name = current_enrollment.batch.name
+            old_batch_id = current_enrollment.batch.id
+
+            # Update the enrollment
+            current_enrollment.batch = target_batch
+            current_enrollment.save()
+
+            # Log the transfer activity
+            log_activity(
+                user=request.user,
+                action_type='BATCH_TRANSFER',
+                enrollment_id=current_enrollment.id,
+                student_id=current_enrollment.student.id,
+                student_name=current_enrollment.student.name,
+                course=target_batch.course.name,
+                from_batch_id=old_batch_id,
+                from_batch=old_batch_name,
+                to_batch_id=target_batch.id,
+                to_batch=target_batch.name,
+                description=f"Transferred {current_enrollment.student.name} from {old_batch_name} to {target_batch.name}"
+            )
+
+            return Response({
+                "message": f"Successfully transferred {current_enrollment.student.name} from {old_batch_name} to {target_batch.name}",
+                "enrollment_id": current_enrollment.id,
+                "student_name": current_enrollment.student.name,
+                "previous_batch": old_batch_name,
+                "new_batch": target_batch.name,
+                "course_name": target_batch.course.name
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error transferring student: {str(e)}")
+            return Response({
+                "error": f"An error occurred while transferring: {str(e)}"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'])
     def unenroll(self, request, pk=None):
         """
         Unenroll a student by deactivating their enrollment
@@ -1016,7 +1133,17 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             enrollment.save()
 
             # Log the unenrollment
-            logger.info(f"Unenrolled student {enrollment.student.name} from {enrollment.batch.name}")
+            log_activity(
+                user=request.user,
+                action_type='BATCH_TRANSFER',  # Using BATCH_TRANSFER since there is no UNENROLLMENT type
+                enrollment_id=enrollment.id,
+                student_id=enrollment.student.id,
+                student_name=enrollment.student.name,
+                course=enrollment.batch.course.name,
+                batch=enrollment.batch.name,
+                action="unenroll",
+                description=f"Unenrolled {enrollment.student.name} from {enrollment.batch.course.name} - {enrollment.batch.name}"
+            )
 
             return Response({
                 "message": f"Successfully unenrolled {enrollment.student.name} from {enrollment.batch.course.name} - {enrollment.batch.name}",
@@ -1031,6 +1158,119 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             return Response({
                 "error": f"An error occurred while unenrolling: {str(e)}"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'])
+    def apply_coupon(self, request, pk=None):
+        """
+        Apply a coupon to an existing enrollment for tuition fee reduction
+        This can be used anytime after enrollment for applicable coupons
+        """
+        enrollment = self.get_object()
+        coupon_code = request.data.get('coupon_code')
+
+        if not coupon_code:
+            return Response(
+                {"error": "Coupon code is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Check if this is the user's student
+        if not request.user.is_staff and enrollment.student.parent != request.user:
+            return Response(
+                {"error": "You don't have permission to apply coupon to this enrollment"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            # Get the coupon
+            coupon = Coupon.objects.get(code=coupon_code)
+
+            # Check if coupon is expired
+            if coupon.expires_at < timezone.now():
+                return Response(
+                    {"error": "This coupon has expired"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Check if coupon includes tuition discount
+            if 'TUITION' not in coupon.discount_types or not coupon.discount_value:
+                return Response(
+                    {"error": "This coupon does not include tuition fee discounts"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Get the current month
+            current_month = timezone.now().date().replace(day=1)
+
+            # Find unpaid invoices for this enrollment from current month forward
+            unpaid_future_invoices = Invoice.objects.filter(
+                enrollment=enrollment,
+                is_paid=False,
+                month__gte=current_month
+            ).order_by('month')
+
+            if not unpaid_future_invoices.exists():
+                return Response({
+                    "message": "No unpaid future invoices found to apply discount",
+                    "enrollment": EnrollmentSerializer(enrollment).data
+                })
+
+            # Calculate the discount percentage
+            discount_percentage = coupon.discount_value
+
+            # Apply the discount to all unpaid future invoices
+            updated_invoices = []
+            with transaction.atomic():
+                for invoice in unpaid_future_invoices:
+                    original_amount = invoice.amount
+                    discount_amount = (original_amount * Decimal(str(discount_percentage))) / 100
+                    new_amount = original_amount - discount_amount
+
+                    # Update the invoice with the discounted amount
+                    invoice.amount = new_amount
+                    invoice.coupon = coupon
+                    invoice.save()
+
+                    # Track invoice changes
+                    updated_invoices.append({
+                        'month': invoice.month.strftime('%B %Y'),
+                        'original_amount': str(original_amount),
+                        'discount_amount': str(discount_amount),
+                        'new_amount': str(new_amount)
+                    })
+
+                # Log the activity
+                log_activity(
+                    user=request.user,
+                    action_type='FEE_MODIFICATION',
+                    student_id=enrollment.student.id,
+                    student_name=enrollment.student.name,
+                    enrollment_id=enrollment.id,
+                    course=enrollment.batch.course.name,
+                    batch=enrollment.batch.name,
+                    coupon_code=coupon_code,
+                    discount=str(discount_percentage),
+                    invoices_updated=len(updated_invoices)
+                )
+
+            return Response({
+                "success": True,
+                "message": f"Applied {discount_percentage}% discount to {len(updated_invoices)} future invoices",
+                "updated_invoices": updated_invoices,
+                "enrollment": EnrollmentSerializer(enrollment).data
+            })
+
+        except Coupon.DoesNotExist:
+            return Response(
+                {"error": "Invalid coupon code"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Error applying coupon to enrollment: {str(e)}")
+            return Response(
+                {"error": f"Failed to apply coupon: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class CouponViewSet(viewsets.ModelViewSet):

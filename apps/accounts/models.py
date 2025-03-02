@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.core.validators import RegexValidator, URLValidator
+from simple_history.models import HistoricalRecords
 
 
 class UserManager(BaseUserManager):
@@ -64,6 +65,7 @@ class User(AbstractUser):
     is_admin = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords()  # Add history tracking
 
     objects = UserManager()
 
@@ -87,6 +89,7 @@ class Student(models.Model):
     mother_name = models.CharField(max_length=100)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords()  # Add history tracking
 
     def __str__(self):
         return f"{self.name} (Child of {self.parent.name})"

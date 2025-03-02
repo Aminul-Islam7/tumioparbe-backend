@@ -3,23 +3,26 @@ from django.db.models import Q
 from django.core.exceptions import ValidationError
 from apps.accounts.models import Student
 from apps.courses.models import Batch
+from simple_history.models import HistoricalRecords
 
 
 class Enrollment(models.Model):
     student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='enrollments')
     batch = models.ForeignKey(Batch, on_delete=models.CASCADE, related_name='enrollments')
     start_month = models.DateField()
-    tuition_fee = models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    tuition_fee = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords()  # Add history tracking
 
     class Meta:
         db_table = 'enrollments'
-        unique_together = ['student', 'batch']
+        unique_together = ['student', 'batch', 'is_active']
+        ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.student.name} - {self.batch.name}"
+        return f"{self.student.name} - {self.batch.name} ({self.start_month.strftime('%b %Y')})"
 
     @classmethod
     def student_has_active_enrollment_in_course(cls, student_id, course_id):
@@ -67,22 +70,18 @@ class Enrollment(models.Model):
 
 
 class Coupon(models.Model):
-    DISCOUNT_TYPE_CHOICES = [
-        ('TUITION', 'Tuition Discount'),
-        ('ADMISSION', 'Admission Fee Waiver'),
-        ('FIRST_MONTH', 'First Month Waiver'),
-    ]
-
     code = models.CharField(max_length=20, unique=True)
-    name = models.CharField(max_length=100)
-    discount_types = models.JSONField()  # List of discount types
+    description = models.TextField()
+    discount_types = models.JSONField(default=list)  # Options: ADMISSION, FIRST_MONTH, TUITION
     discount_value = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)  # For percentage discounts
     expires_at = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords()  # Also add history tracking to coupons
 
     class Meta:
         db_table = 'coupons'
 
     def __str__(self):
-        return f"{self.name} ({self.code})"
+        return self.code

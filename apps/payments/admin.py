@@ -6,11 +6,13 @@ from django.contrib import messages
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from django import forms
+from simple_history.admin import SimpleHistoryAdmin
 
 from apps.payments.models import Invoice, Payment
 from apps.accounts.models import Student
 from apps.courses.models import Batch
 from services.bkash import bkash_client
+from apps.common.utils import log_activity
 import logging
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,7 @@ class EnrollmentRecoveryForm(forms.Form):
 
 
 @admin.register(Invoice)
-class InvoiceAdmin(admin.ModelAdmin):
+class InvoiceAdmin(SimpleHistoryAdmin):
     list_display = ('invoice_id', 'student_name', 'parent_phone', 'course_name', 'batch_name', 'month_display',
                     'amount_display', 'payment_status', 'created_at')
     list_filter = ('is_paid', 'month', 'enrollment__batch__course', 'enrollment__batch')
@@ -63,6 +65,7 @@ class InvoiceAdmin(admin.ModelAdmin):
         }),
     )
     raw_id_fields = ('enrollment', 'coupon')
+    history_list_display = ['amount', 'is_paid', 'month']
 
     def invoice_id(self, obj):
         return f"INV-{obj.id}"
@@ -231,7 +234,7 @@ class InvoiceAdmin(admin.ModelAdmin):
         else:
             # Generate a manual payment record
             transaction_id = f"MANUAL-{timezone.now().strftime('%Y%m%d')}-{get_random_string(6).upper()}"
-            Payment.objects.create(
+            payment = Payment.objects.create(
                 invoice=invoice,
                 transaction_id=transaction_id,
                 amount=invoice.amount,
@@ -243,6 +246,19 @@ class InvoiceAdmin(admin.ModelAdmin):
 
             invoice.is_paid = True
             invoice.save()
+
+            # Log the activity
+            log_activity(
+                user=request.user,
+                action_type='PAYMENT',
+                invoice_id=invoice.id,
+                payment_id=payment.id,
+                amount=str(invoice.amount),
+                method='Manual',
+                status='COMPLETED',
+                description='Invoice marked as paid manually'
+            )
+
             messages.success(request, f"Invoice #{invoice_id} has been marked as paid successfully.")
 
         return HttpResponseRedirect(reverse('admin:payments_invoice_change', args=[invoice_id]))
@@ -262,6 +278,17 @@ class InvoiceAdmin(admin.ModelAdmin):
 
             invoice.is_paid = False
             invoice.save()
+
+            # Log the activity
+            log_activity(
+                user=request.user,
+                action_type='FEE_MODIFICATION',
+                invoice_id=invoice.id,
+                action='mark_unpaid',
+                previous_status='paid',
+                description='Invoice marked as unpaid manually'
+            )
+
             messages.success(request, f"Invoice #{invoice_id} has been marked as unpaid. Existing payments have been marked as failed.")
 
         return HttpResponseRedirect(reverse('admin:payments_invoice_change', args=[invoice_id]))
@@ -274,7 +301,7 @@ class InvoiceAdmin(admin.ModelAdmin):
 
 
 @admin.register(Payment)
-class PaymentAdmin(admin.ModelAdmin):
+class PaymentAdmin(SimpleHistoryAdmin):
     list_display = ('transaction_id', 'invoice_details', 'amount_display', 'payment_method', 'payment_status_display', 'created_at')
     list_filter = ('payment_method', 'status', 'created_at')
     search_fields = ('transaction_id', 'payment_id', 'invoice__enrollment__student__name', 'invoice__enrollment__student__parent__phone')
@@ -297,6 +324,7 @@ class PaymentAdmin(admin.ModelAdmin):
         }),
     )
     raw_id_fields = ('invoice',)
+    history_list_display = ['status', 'amount', 'payment_method']
 
     def payment_status_display(self, obj):
         if obj.status == Payment.COMPLETED:

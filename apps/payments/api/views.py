@@ -22,6 +22,7 @@ from apps.payments.models import Invoice, Payment
 from apps.enrollments.models import Enrollment, Coupon
 from apps.payments.api.serializers import PaymentSerializer, PaymentInitiateSerializer, InvoiceSerializer, ManualInvoiceCreateSerializer, BulkPaymentInitiateSerializer
 from services.bkash import bkash_client
+from apps.common.utils import log_activity
 
 import logging
 import datetime
@@ -199,6 +200,18 @@ class PaymentViewSet(viewsets.ModelViewSet):
                     payment_id=payment_response.get('paymentID'),
                     payer_reference=customer_phone,
                     payment_create_time=timezone.now()
+                )
+
+                # Log the activity
+                log_activity(
+                    user=request.user,
+                    action_type='PAYMENT',
+                    payment_id=payment.id,
+                    payment_method='bKash',
+                    amount=str(total_amount),
+                    invoice_count=len(invoice_ids),
+                    status='INITIATED',
+                    invoice_ids=invoice_ids
                 )
 
                 # Return the bKash URL for redirecting the user
@@ -647,6 +660,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
             )
 
             # If marked as paid, create a manual payment record
+            payment = None
             if is_paid:
                 transaction_id = f"MANUAL-{timezone.now().strftime('%Y%m%d')}-{get_random_string(6).upper()}"
                 payment = Payment.objects.create(
@@ -664,8 +678,22 @@ class PaymentViewSet(viewsets.ModelViewSet):
             else:
                 payment_info = None
 
-            # Add the description to activity log (can be implemented later)
-            logger.info(f"Manual invoice #{invoice.id} created by admin {request.user.username} for {enrollment.student.name}, month: {month.strftime('%B %Y')}, amount: {amount}, paid: {is_paid}")
+            # Log the activity
+            log_activity(
+                user=request.user,
+                action_type='PAYMENT' if is_paid else 'FEE_MODIFICATION',
+                invoice_id=invoice.id,
+                student_id=enrollment.student.id,
+                student_name=enrollment.student.name,
+                enrollment_id=enrollment.id,
+                course=enrollment.batch.course.name,
+                batch=enrollment.batch.name,
+                month=month.strftime('%B %Y'),
+                amount=str(amount),
+                is_paid=is_paid,
+                payment_id=payment.id if payment else None,
+                description=description
+            )
 
             response_data = {
                 "invoice": InvoiceSerializer(invoice).data,

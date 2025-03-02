@@ -53,6 +53,7 @@ THIRD_PARTY_APPS = [
     'django_extensions',
     'django_celery_results',
     'django_celery_beat',
+    'simple_history',  # Added for model history tracking
 ]
 
 LOCAL_APPS = [
@@ -74,6 +75,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'simple_history.middleware.HistoryRequestMiddleware',  # Added for model history tracking
 ]
 
 ROOT_URLCONF = 'core.urls'

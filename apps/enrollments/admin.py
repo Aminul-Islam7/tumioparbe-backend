@@ -6,7 +6,8 @@ from django.http import HttpResponseRedirect
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from apps.enrollments.models import Enrollment, Coupon
-from django.utils import timezone  # Add this import
+from django.utils import timezone
+from simple_history.admin import SimpleHistoryAdmin
 
 
 class CouponAdminForm(ModelForm):
@@ -79,7 +80,7 @@ class CouponAdminForm(ModelForm):
 
 
 @admin.register(Enrollment)
-class EnrollmentAdmin(admin.ModelAdmin):
+class EnrollmentAdmin(SimpleHistoryAdmin):
     list_display = ('enrollment_id', 'student_name', 'parent_name', 'course_name', 'batch_name', 'start_month_display', 'tuition_fee_display', 'is_active', 'created_at')
     list_filter = ('is_active', 'start_month', 'batch__course', 'batch')
     search_fields = ('student__name', 'student__parent__name', 'batch__name', 'batch__course__name')
@@ -102,6 +103,7 @@ class EnrollmentAdmin(admin.ModelAdmin):
     raw_id_fields = ('student', 'batch')
     list_select_related = ('student', 'student__parent', 'batch', 'batch__course')
     actions = ['unenroll_students']
+    history_list_display = ['student', 'batch', 'is_active', 'tuition_fee']
 
     def enrollment_id(self, obj):
         url = reverse('admin:enrollments_enrollment_change', args=[obj.id])
@@ -270,21 +272,30 @@ class EnrollmentAdmin(admin.ModelAdmin):
 
 
 @admin.register(Coupon)
-class CouponAdmin(admin.ModelAdmin):
+class CouponAdmin(SimpleHistoryAdmin):
     form = CouponAdminForm
-    list_display = ('code', 'name', 'discount_types_display', 'discount_value_display', 'expires_at', 'is_expired')
-    list_filter = ('expires_at',)
-    search_fields = ('code', 'name')
+    list_display = ('code', 'description_preview', 'discount_types_display', 'discount_value_display', 'expires_at', 'is_expired')
+    list_filter = ('expires_at', 'is_active')
+    search_fields = ('code', 'description')
     readonly_fields = ('created_at', 'updated_at')
+    history_list_display = ['code', 'is_active', 'expires_at']
+
     fieldsets = (
         ('Coupon Information', {
-            'fields': ('code', 'name', 'discount_types_field', 'discount_value', 'expires_at')
+            'fields': ('code', 'description', 'discount_types_field', 'discount_value', 'expires_at', 'is_active')
         }),
         ('Metadata', {
             'fields': ('created_at', 'updated_at'),
             'classes': ('collapse',)
         }),
     )
+
+    def description_preview(self, obj):
+        """Show a preview of the description"""
+        if obj.description and len(obj.description) > 50:
+            return obj.description[:50] + "..."
+        return obj.description
+    description_preview.short_description = 'Description'
 
     def discount_types_display(self, obj):
         """Display discount types with clear labels"""

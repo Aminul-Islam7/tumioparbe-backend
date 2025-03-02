@@ -1,13 +1,80 @@
 from django.contrib import admin
+from django.utils.safestring import mark_safe
+import json
 from apps.common.models import ActivityLog, SMSLog, SystemSettings
 
 
 @admin.register(ActivityLog)
 class ActivityLogAdmin(admin.ModelAdmin):
-    list_display = ('user', 'action_type', 'created_at')
-    list_filter = ('action_type', 'created_at')
-    search_fields = ('user__name', 'user__phone', 'action_type')
+    list_display = ('user', 'action_type', 'metadata_summary', 'created_at')
+    list_filter = ('action_type', 'created_at', 'user')
+    search_fields = ('user__name', 'user__phone', 'action_type', 'metadata')
     date_hierarchy = 'created_at'
+    readonly_fields = ('created_at', 'metadata_display')
+
+    def metadata_summary(self, obj):
+        """Show a brief summary of metadata in the list view"""
+        if not obj.metadata:
+            return "-"
+
+        # Try to extract the most relevant info based on action_type
+        if obj.action_type == 'PAYMENT':
+            if 'amount' in obj.metadata:
+                return f"Amount: ৳{obj.metadata.get('amount')}, Status: {obj.metadata.get('status', 'N/A')}"
+            elif 'invoice_count' in obj.metadata:
+                return f"Bulk payment of {obj.metadata.get('invoice_count')} invoices"
+
+        elif obj.action_type == 'ENROLLMENT':
+            student_name = obj.metadata.get('student_name', 'Unknown')
+            course = obj.metadata.get('course', 'Unknown')
+            batch = obj.metadata.get('batch', 'Unknown')
+            return f"Student: {student_name}, Course: {course}, Batch: {batch}"
+
+        elif obj.action_type == 'FEE_MODIFICATION':
+            return f"Invoice #{obj.metadata.get('invoice_id', 'N/A')}, Amount: ৳{obj.metadata.get('amount', 'N/A')}"
+
+        elif obj.action_type == 'BATCH_TRANSFER':
+            student_name = obj.metadata.get('student_name', 'Unknown')
+            from_batch = obj.metadata.get('from_batch', 'Unknown')
+            to_batch = obj.metadata.get('to_batch', obj.metadata.get('batch', 'Unknown'))
+
+            if 'action' in obj.metadata and obj.metadata['action'] == 'unenroll':
+                return f"Unenrolled: {student_name} from {to_batch}"
+            else:
+                return f"Transfer: {student_name} from {from_batch} to {to_batch}"
+
+        # For other types, show first key-value pair
+        try:
+            # Get the first key that's not overly detailed
+            exclude_keys = ['description', 'details']
+            keys = [k for k in obj.metadata.keys() if k not in exclude_keys]
+            if keys:
+                first_key = keys[0]
+                return f"{first_key}: {obj.metadata[first_key]}"
+            return "View details..."
+        except:
+            return "View details..."
+
+    metadata_summary.short_description = "Summary"
+
+    def metadata_display(self, obj):
+        """Display the metadata as formatted JSON"""
+        if not obj.metadata:
+            return "No metadata"
+
+        formatted_json = json.dumps(obj.metadata, indent=2)
+        return mark_safe(f"<pre>{formatted_json}</pre>")
+
+    metadata_display.short_description = "Metadata"
+
+    fieldsets = (
+        ('Activity Information', {
+            'fields': ('user', 'action_type', 'created_at')
+        }),
+        ('Metadata', {
+            'fields': ('metadata_display',)
+        }),
+    )
 
 
 @admin.register(SMSLog)
