@@ -3,7 +3,8 @@ from rest_framework.routers import DefaultRouter
 
 from apps.accounts.api.views import (
     StudentViewSet,
-    ProfileView
+    ProfileView,
+    ChangePasswordView
 )
 
 # Create a router for ViewSets
@@ -17,7 +18,11 @@ urlpatterns = [
 
     # Profile - requires authentication
     path('profile/', ProfileView.as_view(), name='profile'),
+    
+    # Change password - requires authentication
+    path('change-password/', ChangePasswordView.as_view(), name='change-password'),
 
     # Include router URLs - requires authentication
     path('', include(router.urls)),
 ]
+

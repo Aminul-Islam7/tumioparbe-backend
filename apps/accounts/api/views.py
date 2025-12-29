@@ -13,7 +13,12 @@ import time
 import re
 
 from apps.accounts.models import Student
-from apps.accounts.api.serializers import UserSerializer, StudentSerializer
+from apps.accounts.api.serializers import (
+    UserSerializer, 
+    StudentSerializer, 
+    ChangePasswordSerializer, 
+    ResetPasswordSerializer
+)
 from services.sms.client import send_otp
 
 # Get logger
@@ -258,3 +263,179 @@ class ProfileView(APIView):
             serializer.save()
             return Response({'success': True, 'data': serializer.data})
         return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ChangePasswordView(APIView):
+    """
+    Change password for authenticated users
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            # Set the new password
+            request.user.set_password(serializer.validated_data['new_password'])
+            request.user.save()
+            
+            return Response({
+                'success': True,
+                'message': 'Password changed successfully.'
+            })
+        return Response({
+            'success': False,
+            'errors': serializer.errors
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@authentication_classes([])
+def request_password_reset_otp(request):
+    """
+    Request an OTP for password reset (forgot password)
+    """
+    phone = request.data.get('phone')
+
+    # Validate phone number with regex
+    if not phone or not BD_PHONE_REGEX.match(phone):
+        return Response({
+            'success': False,
+            'message': 'Invalid phone number format. Must be a valid Bangladesh number (e.g., 01841257770).'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Check if user exists with this phone number
+    if not User.objects.filter(phone=phone).exists():
+        return Response({
+            'success': False,
+            'message': 'No account found with this phone number.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    # Check rate limiting (prevent OTP flooding)
+    last_request_time = cache.get(f"last_reset_otp_request:{phone}")
+    current_time = int(time.time())
+
+    if last_request_time and (current_time - last_request_time < 60):  # 1 minute limit
+        return Response({
+            'success': False,
+            'message': 'Please wait before requesting another OTP.',
+            'retry_after': 60 - (current_time - last_request_time)
+        }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # Update last request time
+    cache.set(f"last_reset_otp_request:{phone}", current_time, 300)
+
+    # Generate a 6-digit OTP
+    otp = str(random.randint(100000, 999999))
+
+    # Store OTP in cache with expiration (using different key for password reset)
+    cache.set(f"password_reset_otp:{phone}", otp, OTP_EXPIRY)
+
+    # Send the OTP via SMS
+    sms_result = send_otp(phone, otp)
+
+    if sms_result.get('success'):
+        logger.info(f"Password reset OTP sent successfully to {phone}")
+    else:
+        logger.error(f"Failed to send password reset OTP to {phone}: {sms_result.get('message')}")
+
+    # For development, return the OTP in the response
+    if settings.DEBUG:
+        return Response({
+            'success': True,
+            'phone': phone,
+            'otp': otp,  # Only in DEBUG mode
+            'expires_in': OTP_EXPIRY,
+            'message': 'OTP generated successfully. In production, this would only be sent via SMS.'
+        })
+    else:
+        return Response({
+            'success': True,
+            'phone': phone,
+            'expires_in': OTP_EXPIRY,
+            'message': 'OTP sent successfully to your phone.'
+        })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@authentication_classes([])
+def reset_password(request):
+    """
+    Reset password after OTP verification
+    """
+    phone = request.data.get('phone')
+    otp = request.data.get('otp')
+    new_password = request.data.get('new_password')
+    confirm_password = request.data.get('confirm_password')
+
+    # Validate inputs
+    if not phone:
+        return Response({'success': False, 'message': 'Phone number is required.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    if not otp:
+        return Response({'success': False, 'message': 'OTP is required.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    if not new_password or not confirm_password:
+        return Response({'success': False, 'message': 'New password and confirmation are required.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    if new_password != confirm_password:
+        return Response({'success': False, 'message': "Passwords don't match."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    if len(new_password) < 6:
+        return Response({'success': False, 'message': 'Password must be at least 6 characters.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    # Check for failed attempts
+    failed_attempts = cache.get(f"failed_reset_otp_attempts:{phone}") or 0
+    if failed_attempts >= 5:
+        return Response({
+            'success': False,
+            'message': 'Too many failed attempts. Please request a new OTP.'
+        }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # Get stored OTP from cache
+    stored_otp = cache.get(f"password_reset_otp:{phone}")
+
+    # Check if OTP exists and is valid
+    if stored_otp and stored_otp == otp:
+        # Clear the OTP and failed attempts after successful verification
+        cache.delete(f"password_reset_otp:{phone}")
+        cache.delete(f"failed_reset_otp_attempts:{phone}")
+
+        # Get user and update password
+        try:
+            user = User.objects.get(phone=phone)
+            user.set_password(new_password)
+            user.save()
+            
+            logger.info(f"Password reset successful for user {phone}")
+
+            return Response({
+                'success': True,
+                'message': 'Password reset successfully. You can now login with your new password.'
+            })
+        except User.DoesNotExist:
+            return Response({
+                'success': False,
+                'message': 'User not found.'
+            }, status=status.HTTP_404_NOT_FOUND)
+    else:
+        # Increment failed attempts
+        cache.set(f"failed_reset_otp_attempts:{phone}", failed_attempts + 1, 300)
+
+        if stored_otp is None:
+            return Response({
+                'success': False,
+                'message': 'OTP has expired or was never sent. Please request a new one.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            return Response({
+                'success': False,
+                'message': 'Invalid OTP. Please try again.',
+                'attempts_left': 5 - (failed_attempts + 1)
+            }, status=status.HTTP_400_BAD_REQUEST)

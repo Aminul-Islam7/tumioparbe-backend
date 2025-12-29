@@ -60,3 +60,34 @@ class StudentSerializer(serializers.ModelSerializer):
         parent = self.context['request'].user
         validated_data['parent'] = parent
         return super().create(validated_data)
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """Serializer for changing password while logged in"""
+    current_password = serializers.CharField(required=True, write_only=True)
+    new_password = serializers.CharField(required=True, write_only=True, min_length=6)
+    confirm_password = serializers.CharField(required=True, write_only=True)
+
+    def validate(self, data):
+        if data.get('new_password') != data.get('confirm_password'):
+            raise serializers.ValidationError({"confirm_password": "New passwords don't match."})
+        return data
+
+    def validate_current_password(self, value):
+        user = self.context['request'].user
+        if not user.check_password(value):
+            raise serializers.ValidationError("Current password is incorrect.")
+        return value
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    """Serializer for resetting password after OTP verification"""
+    phone = serializers.CharField(required=True)
+    new_password = serializers.CharField(required=True, write_only=True, min_length=6)
+    confirm_password = serializers.CharField(required=True, write_only=True)
+
+    def validate(self, data):
+        if data.get('new_password') != data.get('confirm_password'):
+            raise serializers.ValidationError({"confirm_password": "Passwords don't match."})
+        return data
+
