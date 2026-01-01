@@ -1,18 +1,19 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.accounts.api.views import (
     request_otp,
     verify_otp,
     RegisterView,
     request_password_reset_otp,
-    reset_password
+    reset_password,
+    CustomTokenObtainPairView,
 )
 
 # These URLs don't require authentication
 urlpatterns = [
     # Authentication endpoints
-    path('token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('token/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 
     # OTP verification for registration

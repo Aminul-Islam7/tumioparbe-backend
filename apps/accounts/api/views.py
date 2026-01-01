@@ -4,6 +4,9 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.contrib.auth import get_user_model
 from django.conf import settings
 from django.core.cache import cache
@@ -45,6 +48,40 @@ VERIFICATION_EXPIRY = 600  # 10 minutes
 # Bangladesh phone number regex pattern (01X XXXXXXXX)
 BD_PHONE_REGEX = re.compile(r'^01[2-9]\d{8}$')
 
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    """
+    Custom token view that provides better error messages for login failures.
+    - If phone number doesn't exist: "No account exists with this phone number"
+    - If phone exists but password is wrong: "Wrong phone number or password"
+    """
+    
+    def post(self, request, *args, **kwargs):
+        phone = request.data.get('phone')
+        
+        # First, check if the phone number exists
+        if phone and not User.objects.filter(phone=phone).exists():
+            return Response(
+                {'detail': 'No account exists with this phone number.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        # If phone exists, try to authenticate
+        serializer = self.get_serializer(data=request.data)
+        
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as e:
+            raise InvalidToken(e.args[0])
+        except Exception as e:
+            # If authentication fails (wrong password), return a generic message
+            # to not reveal that the phone number exists
+            return Response(
+                {'detail': 'Incorrect password or phone number.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        
+        return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
