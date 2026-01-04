@@ -49,12 +49,31 @@ VERIFICATION_EXPIRY = 600  # 10 minutes
 BD_PHONE_REGEX = re.compile(r'^01[2-9]\d{8}$')
 
 
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """
+    Custom serializer that adds is_staff claim to the JWT token.
+    This is necessary for frontend middleware to identify admin users.
+    """
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        
+        # Add custom claims to the token
+        token['is_staff'] = user.is_staff
+        token['is_admin'] = user.is_admin if hasattr(user, 'is_admin') else user.is_staff
+        token['name'] = user.name
+        
+        return token
+
+
 class CustomTokenObtainPairView(TokenObtainPairView):
     """
-    Custom token view that provides better error messages for login failures.
+    Custom token view that provides better error messages for login failures
+    and includes is_staff claim in the token.
     - If phone number doesn't exist: "No account exists with this phone number"
     - If phone exists but password is wrong: "Wrong phone number or password"
     """
+    serializer_class = CustomTokenObtainPairSerializer
     
     def post(self, request, *args, **kwargs):
         phone = request.data.get('phone')
@@ -256,8 +275,8 @@ class RegisterView(APIView):
                 user.save()
                 logger.info(f"User {user.id} set as admin with phone {phone}")
 
-            # Generate tokens for automatic login
-            refresh = RefreshToken.for_user(user)
+            # Generate tokens for automatic login using custom serializer to include is_staff claim
+            refresh = CustomTokenObtainPairSerializer.get_token(user)
 
             # Remove the phone verification from cache after successful registration
             cache.delete(verified_phone_cache_key(phone))

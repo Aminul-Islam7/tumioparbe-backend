@@ -169,19 +169,70 @@ class BatchViewSet(viewsets.ModelViewSet):
         """
         Returns the list of students enrolled in this batch.
         Only available to staff users or parents with children enrolled in the batch.
+        For staff, returns comprehensive enrollment data.
         """
         batch = self.get_object()
         user = request.user
 
-        # Staff can see all students
+        # Staff can see all students with comprehensive data
         if user.is_staff:
-            enrollments = Enrollment.objects.filter(batch=batch, is_active=True)
-            from apps.accounts.api.serializers import StudentSerializer
-            student_data = [
-                StudentSerializer(enrollment.student).data
-                for enrollment in enrollments
-            ]
-            return Response(student_data)
+            enrollments = Enrollment.objects.filter(batch=batch, is_active=True).select_related(
+                'student', 'student__parent'
+            )
+            
+            enrollment_data = []
+            for enrollment in enrollments:
+                student = enrollment.student
+                parent = student.parent
+                
+                # Determine effective tuition fee and its type
+                if enrollment.tuition_fee is not None:
+                    effective_fee = float(enrollment.tuition_fee)
+                    fee_type = 'individual'
+                elif batch.tuition_fee is not None:
+                    effective_fee = float(batch.tuition_fee)
+                    fee_type = 'batch'
+                else:
+                    effective_fee = float(batch.course.monthly_fee)
+                    fee_type = 'course'
+                
+                # Find earliest enrollment month for this student in this course
+                earliest_enrollment = Enrollment.objects.filter(
+                    student=student,
+                    batch__course=batch.course
+                ).order_by('start_month').first()
+                
+                earliest_month = enrollment.start_month
+                if earliest_enrollment:
+                    earliest_month = earliest_enrollment.start_month
+                
+                enrollment_data.append({
+                    'id': enrollment.id,
+                    'student': {
+                        'id': student.id,
+                        'name': student.name,
+                        'date_of_birth': student.date_of_birth.isoformat() if student.date_of_birth else None,
+                        'parent': {
+                            'id': parent.id,
+                            'name': parent.name,
+                            'phone': parent.phone,
+                        }
+                    },
+                    'batch': {
+                        'id': batch.id,
+                        'name': batch.name,
+                        'course_id': batch.course_id,
+                    },
+                    'tuition_fee': float(enrollment.tuition_fee) if enrollment.tuition_fee else None,
+                    'effective_tuition_fee': effective_fee,
+                    'fee_type': fee_type,
+                    'start_month': enrollment.start_month.isoformat() if enrollment.start_month else None,
+                    'earliest_enrollment_month': earliest_month.isoformat() if earliest_month else None,
+                    'is_active': enrollment.is_active,
+                    'created_at': enrollment.created_at.isoformat() if enrollment.created_at else None,
+                })
+            
+            return Response(enrollment_data)
 
         # Regular users can only see if they have a student enrolled
         has_enrolled_student = Enrollment.objects.filter(
