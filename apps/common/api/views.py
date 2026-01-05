@@ -5,6 +5,7 @@ from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db.models import Sum, Count, Q
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 from datetime import timedelta, date
 from decimal import Decimal
@@ -21,6 +22,7 @@ from apps.courses.models import Course, Batch
 import logging
 
 logger = logging.getLogger(__name__)
+User = get_user_model()
 
 
 class SMSViewSet(viewsets.ReadOnlyModelViewSet):
@@ -249,6 +251,53 @@ class ReportsViewSet(viewsets.ViewSet):
     Admin-only endpoints for dashboard statistics and reporting
     """
     permission_classes = [IsAuthenticated, IsAdminUser]
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """
+        Get aggregated dashboard statistics for admin home
+        """
+        try:
+            today = timezone.now().date()
+            
+            # Counts
+            total_courses = Course.objects.count()
+            active_courses = Course.objects.filter(is_active=True).count()
+            total_batches = Batch.objects.count()
+            total_students = Student.objects.count()
+            
+            # Users
+            total_users = User.objects.count()
+            total_admins = User.objects.filter(Q(is_staff=True) | Q(is_admin=True)).count()
+            total_parents = total_users - total_admins
+            
+            # Payments
+            pending_payments = Invoice.objects.filter(is_paid=False).count()
+            
+            # Revenue (current month)
+            monthly_revenue = Invoice.objects.filter(
+                is_paid=True,
+                month__year=today.year,
+                month__month=today.month
+            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+            return Response({
+                'total_courses': total_courses,
+                'active_courses': active_courses,
+                'total_batches': total_batches,
+                'total_students': total_students,
+                'total_parents': total_parents,
+                'total_admins': total_admins,
+                'pending_payments': pending_payments,
+                'monthly_revenue': float(monthly_revenue),
+            })
+            
+        except Exception as e:
+            logger.error(f"Error generating dashboard stats: {str(e)}")
+            return Response(
+                {"error": f"Failed to generate stats: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=False, methods=['get'])
     def financial_summary(self, request):

@@ -248,6 +248,25 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Payment.DoesNotExist:
             return Response({"error": "Payment not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        # IDEMPOTENCY: If payment is already completed, return success immediately
+        # This handles duplicate requests (e.g., user refresh, network retry)
+        if payment.status == Payment.COMPLETED:
+            logger.info(f"Payment {payment_id} already completed, returning cached result")
+            return Response({
+                "status": "success",
+                "transaction_id": payment.transaction_id,
+                "payment_status": payment.status,
+                "message": "Payment was already completed successfully."
+            })
+
+        # If payment failed or was cancelled, don't try to execute again
+        if payment.status in [Payment.FAILED, Payment.CANCELLED]:
+            return Response({
+                "status": "failed",
+                "message": f"Payment was previously marked as {payment.status}. Please initiate a new payment.",
+                "payment_status": payment.status
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             # Call bKash API to execute payment
             execute_response = bkash_client.execute_payment(payment_id)
@@ -580,10 +599,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
         """
         user = request.user
 
-        # For regular users, only show payments for their students
+        # For regular users, only show COMPLETED payments for their students
         if not user.is_staff:
             payments = Payment.objects.filter(
-                invoice__enrollment__student__parent=user
+                invoice__enrollment__student__parent=user,
+                status=Payment.COMPLETED  # Only show completed payments
             ).select_related(
                 'invoice',
                 'invoice__enrollment',
@@ -592,8 +612,10 @@ class PaymentViewSet(viewsets.ModelViewSet):
                 'invoice__enrollment__batch__course'
             ).order_by('-created_at')
         else:
-            # For staff, show all payments
-            payments = Payment.objects.all().select_related(
+            # For staff, show all COMPLETED payments (can add admin view for all statuses separately)
+            payments = Payment.objects.filter(
+                status=Payment.COMPLETED  # Only show completed payments
+            ).select_related(
                 'invoice',
                 'invoice__enrollment',
                 'invoice__enrollment__student',
@@ -707,6 +729,120 @@ class PaymentViewSet(viewsets.ModelViewSet):
             logger.error(f"Error creating manual invoice: {str(e)}")
             return Response({"error": f"Failed to create invoice: {str(e)}"},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAdminUser])
+    def reconcile_stale_payments(self, request):
+        """
+        Reconcile payments stuck in 'Initiated' status by querying bKash.
+        This handles cases where:
+        - Frontend callback failed (network error, user closed browser)
+        - Webhook failed to deliver
+        - Any other sync issues
+        
+        Should be run periodically (e.g., via cron job or manually by admin)
+        """
+        from datetime import timedelta
+        
+        # Get all payments that have been in 'Initiated' status for more than 5 minutes
+        stale_threshold = timezone.now() - timedelta(minutes=5)
+        # Payments older than 24 hours are likely expired (bKash tokens usually expire)
+        expiry_threshold = timezone.now() - timedelta(hours=24)
+        
+        stale_payments = Payment.objects.filter(
+            status=Payment.INITIATED,
+            created_at__lt=stale_threshold
+        )
+        
+        reconciled = []
+        expired = []
+        errors = []
+        
+        for payment in stale_payments:
+            # If payment is very old, mark as expired/failed
+            if payment.created_at < expiry_threshold:
+                payment.status = Payment.FAILED
+                payment.save()
+                
+                # Also ensure the temp invoice doesn't block the user
+                if payment.invoice and payment.invoice.temp_invoice:
+                    payment.invoice.delete()  # Clean up temp invoices
+                    
+                expired.append({
+                    "payment_id": payment.payment_id,
+                    "reason": "Expired (older than 24 hours)"
+                })
+                logger.info(f"Marked stale payment {payment.payment_id} as expired")
+                continue
+            
+            # Try to query bKash for the actual status
+            try:
+                if not payment.payment_id:
+                    continue
+                    
+                query_response = bkash_client.query_payment(payment.payment_id)
+                
+                if query_response.get("statusCode") == "0000":
+                    transaction_status = query_response.get('transactionStatus')
+                    
+                    if transaction_status == "Completed":
+                        # Payment was actually completed! Update our records
+                        payment.status = Payment.COMPLETED
+                        payment.transaction_id = query_response.get('trxID', payment.transaction_id)
+                        payment.payment_execute_time = timezone.now()
+                        payment.save()
+                        
+                        # Mark invoice as paid
+                        invoice = payment.invoice
+                        if invoice:
+                            invoice.is_paid = True
+                            invoice.save()
+                        
+                        reconciled.append({
+                            "payment_id": payment.payment_id,
+                            "transaction_id": payment.transaction_id,
+                            "status": "Completed",
+                            "action": "Marked as paid"
+                        })
+                        logger.info(f"Reconciled payment {payment.payment_id} - was actually completed")
+                        
+                    elif transaction_status in ["Failed", "Cancelled"]:
+                        payment.status = Payment.FAILED if transaction_status == "Failed" else Payment.CANCELLED
+                        payment.save()
+                        
+                        reconciled.append({
+                            "payment_id": payment.payment_id,
+                            "status": transaction_status,
+                            "action": f"Marked as {transaction_status}"
+                        })
+                        logger.info(f"Reconciled payment {payment.payment_id} - was {transaction_status}")
+                        
+                else:
+                    errors.append({
+                        "payment_id": payment.payment_id,
+                        "error": query_response.get('statusMessage', 'Unknown error')
+                    })
+                    
+            except Exception as e:
+                errors.append({
+                    "payment_id": payment.payment_id,
+                    "error": str(e)
+                })
+                logger.error(f"Error reconciling payment {payment.payment_id}: {str(e)}")
+        
+        return Response({
+            "message": "Reconciliation complete",
+            "summary": {
+                "total_checked": stale_payments.count(),
+                "reconciled": len(reconciled),
+                "expired": len(expired),
+                "errors": len(errors)
+            },
+            "details": {
+                "reconciled": reconciled,
+                "expired": expired,
+                "errors": errors
+            }
+        })
 
 
 @method_decorator(csrf_exempt, name='dispatch')
