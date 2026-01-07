@@ -10,75 +10,6 @@ from django.utils import timezone
 from simple_history.admin import SimpleHistoryAdmin
 
 
-class CouponAdminForm(ModelForm):
-    """Custom form for Coupon admin to provide better UI for discount_types"""
-    DISCOUNT_TYPE_CHOICES = [
-        ('TUITION', 'Tuition Discount (%)'),
-        ('ADMISSION', 'Admission Fee Waiver'),
-        ('FIRST_MONTH', 'First Month Tuition Waiver'),
-    ]
-
-    discount_types_field = MultipleChoiceField(
-        choices=DISCOUNT_TYPE_CHOICES,
-        widget=CheckboxSelectMultiple,
-        required=True,
-        help_text="Select one or more discount types. Multiple types can be combined."
-    )
-
-    class Meta:
-        model = Coupon
-        fields = '__all__'
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Pre-select current values if editing existing coupon
-        if self.instance.pk and hasattr(self.instance, 'discount_types') and self.instance.discount_types:
-            self.initial['discount_types_field'] = self.instance.discount_types
-
-        # Add hint for discount value field
-        self.fields['discount_value'].help_text = "Percentage discount for tuition fee (only used if 'Tuition Discount' is selected)"
-
-    def clean(self):
-        cleaned_data = super().clean()
-        discount_types = cleaned_data.get('discount_types_field', [])
-
-        # Ensure discount_types is not empty
-        if not discount_types:
-            self.add_error('discount_types_field', 'At least one discount type must be selected')
-
-        discount_value = cleaned_data.get('discount_value')
-
-        # If TUITION is selected, discount_value is required
-        if 'TUITION' in discount_types and not discount_value:
-            self.add_error('discount_value', 'Discount value is required when Tuition Discount is selected')
-
-        # If TUITION is not selected but discount_value is provided, clear it
-        if 'TUITION' not in discount_types and discount_value:
-            cleaned_data['discount_value'] = None
-
-        # Copy the selected discount types to the JSON field
-        cleaned_data['discount_types'] = discount_types
-
-        return cleaned_data
-
-    def save(self, commit=True):
-        """Override save to ensure discount_types is properly set"""
-        instance = super().save(commit=False)
-
-        # Ensure discount_types is set to a valid value (at least an empty list)
-        if not hasattr(instance, 'discount_types') or instance.discount_types is None:
-            instance.discount_types = []
-
-        # Copy from the form field if available
-        if 'discount_types_field' in self.cleaned_data and self.cleaned_data['discount_types_field']:
-            instance.discount_types = self.cleaned_data['discount_types_field']
-
-        if commit:
-            instance.save()
-
-        return instance
-
-
 @admin.register(Enrollment)
 class EnrollmentAdmin(SimpleHistoryAdmin):
     list_display = ('enrollment_id', 'student_name', 'parent_name', 'course_name', 'batch_name', 'start_month_display', 'tuition_fee_display', 'is_active', 'created_at')
@@ -235,10 +166,6 @@ class EnrollmentAdmin(SimpleHistoryAdmin):
         except ValidationError as e:
             # Add the validation error to the form's non-field errors
             form.add_error(None, e.message if hasattr(e, 'message') else str(e))
-            # Display error message to the user
-            # messages.error(request, str(e))
-            # Re-raise the exception to prevent the admin from proceeding
-            # This will stop the save process and keep the user on the form page
             raise
 
     def change_view(self, request, object_id, form_url='', extra_context=None):
@@ -273,16 +200,22 @@ class EnrollmentAdmin(SimpleHistoryAdmin):
 
 @admin.register(Coupon)
 class CouponAdmin(SimpleHistoryAdmin):
-    form = CouponAdminForm
-    list_display = ('code', 'description_preview', 'discount_types_display', 'discount_value_display', 'expires_at', 'is_expired')
-    list_filter = ('expires_at', 'is_active')
-    search_fields = ('code', 'description')
+    list_display = ('code', 'course_display', 'is_public', 'offer_message_preview', 'expires_at', 'is_active', 'is_expired')
+    list_filter = ('is_active', 'is_public', 'course', 'expires_at')
+    search_fields = ('code', 'description', 'offer_message', 'course__name')
     readonly_fields = ('created_at', 'updated_at')
     history_list_display = ['code', 'is_active', 'expires_at']
 
     fieldsets = (
         ('Coupon Information', {
-            'fields': ('code', 'description', 'discount_types_field', 'discount_value', 'expires_at', 'is_active')
+            'fields': ('code', 'course', 'description', 'offer_message', 'is_public')
+        }),
+        ('Discount Details', {
+            'fields': ('admission_fee_discount', 'tuition_fee_discount', 'first_month_discount'),
+            'description': 'Enter exact amounts to be deducted.'
+        }),
+        ('Status', {
+            'fields': ('expires_at', 'is_active')
         }),
         ('Metadata', {
             'fields': ('created_at', 'updated_at'),
@@ -290,61 +223,21 @@ class CouponAdmin(SimpleHistoryAdmin):
         }),
     )
 
-    def description_preview(self, obj):
-        """Show a preview of the description"""
-        if obj.description and len(obj.description) > 50:
-            return obj.description[:50] + "..."
-        return obj.description
-    description_preview.short_description = 'Description'
+    def course_display(self, obj):
+        return obj.course.name if obj.course else "All Courses"
+    course_display.short_description = 'Course'
+    course_display.admin_order_field = 'course__name'
 
-    def discount_types_display(self, obj):
-        """Display discount types with clear labels"""
-        type_map = {
-            'TUITION': 'Tuition Discount',
-            'ADMISSION': 'Admission Fee Waiver',
-            'FIRST_MONTH': 'First Month Waiver'
-        }
-
-        types = []
-        benefits = []
-
-        for discount_type in obj.discount_types:
-            if discount_type in type_map:
-                types.append(type_map[discount_type])
-
-                # # Add specific benefit description
-                # if discount_type == 'TUITION' and obj.discount_value:
-                #     benefits.append(f"{obj.discount_value}% off monthly tuition fee")
-                # elif discount_type == 'ADMISSION':
-                #     benefits.append("Admission fee waived (set to ৳0.00)")
-                # elif discount_type == 'FIRST_MONTH':
-                #     benefits.append("First month tuition fee waived")
-
-        # Show discount types and benefits
-        if benefits:
-            benefits_html = "".join([format_html("<li>{}</li>", benefit) for benefit in benefits])
-            return format_html(
-                "{}<br/><ul style='margin-top: 5px; margin-bottom: 0;'>{}</ul>",
-                ", ".join(types),
-                benefits_html
-            )
-        return ", ".join(types)
-
-    discount_types_display.short_description = 'Discount Types'
-
-    def discount_value_display(self, obj):
-        if 'TUITION' in obj.discount_types and obj.discount_value:
-            return f"{obj.discount_value}%"
-        return "-"
-    discount_value_display.short_description = 'Discount Value'
+    def offer_message_preview(self, obj):
+        if obj.offer_message and len(obj.offer_message) > 50:
+            return obj.offer_message[:50] + "..."
+        return obj.offer_message
+    offer_message_preview.short_description = 'Offer Message'
 
     def is_expired(self, obj):
         """Check if the coupon is expired"""
-        return obj.expires_at < timezone.now()  # Return only the boolean result
+        if obj.expires_at is None:
+            return False
+        return obj.expires_at < timezone.now()
     is_expired.short_description = 'Expired'
-    is_expired.boolean = True  # This tells Django admin to display as a boolean icon
-
-    def save_model(self, request, obj, form, change):
-        """Custom save method to handle discount_types field"""
-        # discount_types is already set in the form's clean method
-        super().save_model(request, obj, form, change)
+    is_expired.boolean = True

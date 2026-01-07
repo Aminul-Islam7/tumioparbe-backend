@@ -23,12 +23,14 @@ class CourseSerializer(serializers.ModelSerializer):
     batches = BatchSerializer(many=True, read_only=True)
     batch_count = serializers.SerializerMethodField()
     student_count = serializers.SerializerMethodField()
+    featured_coupon_details = serializers.SerializerMethodField()
 
     class Meta:
         model = Course
         fields = ['id', 'name', 'description', 'image', 'admission_fee', 'monthly_fee',
-                  'is_active', 'created_at', 'updated_at', 'batches', 'batch_count', 'student_count']
-        read_only_fields = ['id', 'created_at', 'updated_at', 'batch_count', 'student_count']
+                  'is_active', 'featured_coupon', 'featured_coupon_details', 
+                  'created_at', 'updated_at', 'batches', 'batch_count', 'student_count']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'batch_count', 'student_count', 'featured_coupon_details']
 
     def get_batch_count(self, obj):
         """Get the number of batches for this course"""
@@ -37,11 +39,28 @@ class CourseSerializer(serializers.ModelSerializer):
     def get_student_count(self, obj):
         """Get the number of active enrolled students across all batches"""
         from apps.enrollments.models import Enrollment
-        # Use a more direct approach
         return Enrollment.objects.filter(
             batch__course=obj,
             is_active=True
         ).count()
+    
+    def get_featured_coupon_details(self, obj):
+        """Get featured coupon details with calculated discounted prices"""
+        if not obj.featured_coupon or not obj.featured_coupon.is_valid:
+            return None
+        
+        coupon = obj.featured_coupon
+        return {
+            'id': coupon.id,
+            'code': coupon.code,
+            'offer_message': coupon.offer_message,
+            'admission_fee_discount': float(coupon.admission_fee_discount),
+            'tuition_fee_discount': float(coupon.tuition_fee_discount),
+            'first_month_discount': float(coupon.first_month_discount),
+            'discounted_admission_fee': max(0, float(obj.admission_fee) - float(coupon.admission_fee_discount)),
+            'discounted_monthly_fee': max(0, float(obj.monthly_fee) - float(coupon.tuition_fee_discount)),
+        }
+
 
 
 class BatchDetailSerializer(BatchSerializer):

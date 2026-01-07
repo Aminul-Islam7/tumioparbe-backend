@@ -71,17 +71,68 @@ class Enrollment(models.Model):
 
 class Coupon(models.Model):
     code = models.CharField(max_length=20, unique=True)
-    description = models.TextField()
-    discount_types = models.JSONField(default=list)  # Options: ADMISSION, FIRST_MONTH, TUITION
-    discount_value = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)  # For percentage discounts
-    expires_at = models.DateTimeField()
+    description = models.TextField(blank=True, help_text="Internal description for admin reference")
+    offer_message = models.CharField(max_length=255, blank=True, help_text="Promotional message shown to parents (e.g., '50% off admission fee!')")
+    
+    # Course association - null means applies to all courses
+    course = models.ForeignKey(
+        'courses.Course', 
+        on_delete=models.CASCADE, 
+        related_name='coupons',
+        null=True, 
+        blank=True,
+        help_text="Leave empty to apply to all courses"
+    )
+    
+    # Visibility
+    is_public = models.BooleanField(default=False, help_text="Public coupons are shown in the list during enrollment")
+    
+    # Discount amounts (exact values, not percentages)
+    admission_fee_discount = models.DecimalField(
+        max_digits=10, 
+        decimal_places=2, 
+        default=0,
+        help_text="Amount to deduct from admission fee"
+    )
+    tuition_fee_discount = models.DecimalField(
+        max_digits=10, 
+        decimal_places=2, 
+        default=0,
+        help_text="Amount to deduct from monthly tuition fee"
+    )
+    first_month_discount = models.DecimalField(
+        max_digits=10, 
+        decimal_places=2, 
+        default=0,
+        help_text="Additional discount for the first month only"
+    )
+    
+    # Status
+    # Status
+    expires_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    history = HistoricalRecords()  # Also add history tracking to coupons
+    history = HistoricalRecords()
 
     class Meta:
         db_table = 'coupons'
 
     def __str__(self):
-        return self.code
+        course_name = self.course.name if self.course else "All Courses"
+        return f"{self.code} ({course_name})"
+    
+    @property
+    def is_valid(self):
+        """Check if coupon is currently valid (active and not expired)"""
+        from django.utils import timezone
+        if not self.is_active:
+            return False
+        if self.expires_at and self.expires_at <= timezone.now():
+            return False
+        return True
+    
+    def applies_to_course(self, course_id):
+        """Check if this coupon applies to a specific course"""
+        return self.course_id is None or self.course_id == course_id
+

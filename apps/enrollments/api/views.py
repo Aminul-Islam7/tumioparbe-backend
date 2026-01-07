@@ -82,42 +82,45 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
             # Calculate fees
             admission_fee = course.admission_fee
-            tuition_fee = batch.tuition_fee or course.monthly_fee
+            original_tuition_fee = batch.tuition_fee or course.monthly_fee
+            recurring_tuition_fee = original_tuition_fee
+            first_month_payable = original_tuition_fee
 
             # Apply coupon if provided
             coupon = None
             first_month_waiver = False
+            
             if coupon_code:
                 try:
-                    coupon = Coupon.objects.get(code=coupon_code)
+                    coupon = Coupon.objects.get(code__iexact=coupon_code)
 
-                    # Check if coupon is expired
-                    if coupon.expires_at < timezone.now():
+                    # Check if coupon is valid
+                    if not coupon.is_valid:
+                         return Response(
+                            {"error": "This coupon is invalid or expired"},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    
+                    # Check course applicability
+                    if not coupon.applies_to_course(course.id):
                         return Response(
-                            {"error": "This coupon has expired"},
+                            {"error": "This coupon does not apply to this course"},
                             status=status.HTTP_400_BAD_REQUEST
                         )
 
-                    # Apply coupon discounts
-                    discount_types = coupon.discount_types
+                    # 1. Apply Admission Fee Discount
+                    if coupon.admission_fee_discount > 0:
+                         admission_fee = max(Decimal('0.00'), admission_fee - coupon.admission_fee_discount)
 
-                    # Apply admission fee waiver if applicable
-                    if 'ADMISSION' in discount_types:
-                        admission_fee = Decimal('0.00')
+                    # 2. Apply Tuition Fee Discount (Recurring)
+                    if coupon.tuition_fee_discount > 0:
+                        recurring_tuition_fee = max(Decimal('0.00'), recurring_tuition_fee - coupon.tuition_fee_discount)
+                        # Update first month base to the new recurring fee
+                        first_month_payable = recurring_tuition_fee
 
-                    # Apply first month fee waiver if applicable
-                    if 'FIRST_MONTH' in discount_types:
-                        first_month_waiver = True
-                        # First month tuition is waived
-                        # We don't set tuition_fee to 0 here as this will be used
-                        # to calculate the second month fee if first month is waived
-
-                    # Apply tuition discount if applicable
-                    if 'TUITION' in discount_types and coupon.discount_value:
-                        # Apply percentage discount to tuition fee
-                        discount = (tuition_fee * coupon.discount_value) / 100
-                        tuition_fee = tuition_fee - discount
-                        # Store the discounted tuition fee, will be used for enrollment
+                    # 3. Apply First Month Additional Discount
+                    if coupon.first_month_discount > 0:
+                        first_month_payable = max(Decimal('0.00'), first_month_payable - coupon.first_month_discount)
 
                 except Coupon.DoesNotExist:
                     return Response(
@@ -125,27 +128,28 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-            # Calculate total amount
-            # If first month is waived, include second month tuition in the enrollment payment
-            if first_month_waiver:
-                total_amount = admission_fee + tuition_fee  # Second month fee
-                logger.info(f"First month waived, showing admission ({admission_fee}) + second month fee ({tuition_fee})")
-                display_tuition_fee = Decimal('0.00')  # First month is free
+            # Calculate total amount to pay now
+            if first_month_payable == 0:
+                first_month_waiver = True
+                # If first month is free, we charge admission + 2nd month (recurring fee)
+                # This ensures commitment and payment method setup
+                total_amount = admission_fee + recurring_tuition_fee
+                display_tuition_fee = Decimal('0.00')
+                logger.info(f"First month waived, showing admission ({admission_fee}) + second month fee ({recurring_tuition_fee})")
             else:
-                total_amount = admission_fee + tuition_fee  # First month fee
-                display_tuition_fee = tuition_fee
-                logger.info(f"Regular enrollment: admission ({admission_fee}) + first month fee ({tuition_fee})")
+                total_amount = admission_fee + first_month_payable
+                display_tuition_fee = first_month_payable
+                logger.info(f"Regular enrollment: admission ({admission_fee}) + first month fee ({first_month_payable})")
 
             # Always require payment - No free enrollments
             payment_required = True
             if total_amount <= 0:
                 # If all fees are waived, still require at least 1 taka payment
-                # This is a business rule: no enrollment without payment
                 total_amount = Decimal('1.00')
                 logger.info("All fees waived, setting minimum payment amount to 1.00")
 
-            # Store the full tuition fee for use in the enrollment
-            stored_tuition_fee = tuition_fee if tuition_fee > 0 else batch.tuition_fee or course.monthly_fee
+            # Store the recurring tuition fee for use in the enrollment object
+            stored_tuition_fee = recurring_tuition_fee
 
             # Create a response with enrollment details
             response_data = {
@@ -207,12 +211,15 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             coupon_code = enrollment_data.get('coupon_code')
             coupon = None
             first_month_waiver = False
+            first_month_amount = enrollment.tuition_fee
 
             if coupon_code:
                 try:
-                    coupon = Coupon.objects.get(code=coupon_code)
-                    if 'FIRST_MONTH' in coupon.discount_types:
-                        first_month_waiver = True
+                    coupon = Coupon.objects.get(code__iexact=coupon_code)
+                    if coupon.first_month_discount > 0:
+                        first_month_amount = max(Decimal('0.00'), first_month_amount - coupon.first_month_discount)
+                        if first_month_amount == 0:
+                            first_month_waiver = True
                 except Coupon.DoesNotExist:
                     pass
 
@@ -220,7 +227,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
             Invoice.objects.create(
                 enrollment=enrollment,
                 month=first_month,
-                amount=Decimal('0.00') if first_month_waiver else enrollment.tuition_fee,
+                amount=first_month_amount,
                 is_paid=True,  # First month is paid as part of enrollment
                 coupon=coupon
             )
@@ -295,34 +302,42 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
             # Calculate fees
             admission_fee = course.admission_fee
-            tuition_fee = batch.tuition_fee or course.monthly_fee
+            original_tuition_fee = batch.tuition_fee or course.monthly_fee
+            recurring_tuition_fee = original_tuition_fee
+            first_month_payable = original_tuition_fee
 
             # Apply coupon if provided
             coupon = None
             first_month_waiver = False
             if coupon_code:
                 try:
-                    coupon = Coupon.objects.get(code=coupon_code)
-                    if coupon.expires_at < timezone.now():
+                    coupon = Coupon.objects.get(code__iexact=coupon_code)
+
+                    if not coupon.is_valid:
                         return Response(
-                            {"error": "This coupon has expired"},
+                            {"error": "This coupon is invalid or expired"},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    
+                    if not coupon.applies_to_course(course.id):
+                         return Response(
+                            {"error": "This coupon does not apply to this course"},
                             status=status.HTTP_400_BAD_REQUEST
                         )
 
-                    # Apply coupon discounts
-                    discount_types = coupon.discount_types
-                    if 'ADMISSION' in discount_types:
-                        admission_fee = Decimal('0.00')
+                    # 1. Apply Admission Fee Discount
+                    if coupon.admission_fee_discount > 0:
+                         admission_fee = max(Decimal('0.00'), admission_fee - coupon.admission_fee_discount)
 
-                    if 'FIRST_MONTH' in discount_types:
-                        first_month_waiver = True
-                        # First month tuition is waived
-                        # We don't set tuition_fee to 0 here as we'll use it below for second month
+                    # 2. Apply Tuition Fee Discount (Recurring)
+                    if coupon.tuition_fee_discount > 0:
+                        recurring_tuition_fee = max(Decimal('0.00'), recurring_tuition_fee - coupon.tuition_fee_discount)
+                        first_month_payable = recurring_tuition_fee
 
-                    if 'TUITION' in discount_types and coupon.discount_value:
-                        # Apply percentage discount to tuition fee
-                        discount = (tuition_fee * coupon.discount_value) / 100
-                        tuition_fee = tuition_fee - discount
+                    # 3. Apply First Month Additional Discount
+                    if coupon.first_month_discount > 0:
+                        first_month_payable = max(Decimal('0.00'), first_month_payable - coupon.first_month_discount)
+
                 except Coupon.DoesNotExist:
                     return Response(
                         {"error": "Invalid coupon code"},
@@ -330,13 +345,14 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     )
 
             # Calculate total amount
-            # If first month is waived, include second month tuition in the enrollment payment
-            if first_month_waiver:
-                total_amount = admission_fee + tuition_fee  # Second month fee
-                logger.info(f"First month waived, charging admission ({admission_fee}) + second month fee ({tuition_fee})")
+            # If first month is waived (payable is 0), include second month tuition in the enrollment payment
+            if first_month_payable == 0:
+                first_month_waiver = True
+                total_amount = admission_fee + recurring_tuition_fee
+                logger.info(f"First month waived, charging admission ({admission_fee}) + second month fee ({recurring_tuition_fee})")
             else:
-                total_amount = admission_fee + tuition_fee  # First month fee
-                logger.info(f"Regular enrollment payment: admission ({admission_fee}) + first month fee ({tuition_fee})")
+                total_amount = admission_fee + first_month_payable  # First month fee
+                logger.info(f"Regular enrollment payment: admission ({admission_fee}) + first month fee ({first_month_payable})")
 
             # Always require payment - No free enrollments
             if total_amount <= 0:
@@ -575,11 +591,14 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
             if coupon_code:
                 try:
-                    coupon = Coupon.objects.get(code=coupon_code)
-                    if 'FIRST_MONTH' in coupon.discount_types:
-                        first_month_waiver = True
-                        first_month_fee = Decimal('0.00')
-                        logger.info("First month fee waived due to coupon")
+                    coupon = Coupon.objects.get(code__iexact=coupon_code)
+                    if coupon.first_month_discount > 0 and not first_month_waiver:
+                        first_month_fee = max(Decimal('0.00'), first_month_fee - coupon.first_month_discount)
+                        if first_month_fee == 0:
+                            first_month_waiver = True
+                            logger.info("First month fee waived due to coupon (calculated)")
+                        else:
+                            logger.info(f"First month fee reduced to {first_month_fee}")
                 except Coupon.DoesNotExist:
                     logger.warning(f"Coupon code {coupon_code} not found")
 
@@ -882,7 +901,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
                     if coupon_code:
                         try:
-                            coupon = Coupon.objects.get(code=coupon_code)
+                            coupon = Coupon.objects.get(code__iexact=coupon_code)
                             if 'FIRST_MONTH' in coupon.discount_types:
                                 first_month_waiver = True
                                 first_month_fee = Decimal('0.00')
@@ -1183,7 +1202,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
 
         try:
             # Get the coupon
-            coupon = Coupon.objects.get(code=coupon_code)
+            coupon = Coupon.objects.get(code__iexact=coupon_code)
 
             # Check if coupon is expired
             if coupon.expires_at < timezone.now():
@@ -1292,9 +1311,64 @@ class CouponViewSet(viewsets.ModelViewSet):
         return super().get_permissions()
 
     @action(detail=False, methods=['get'])
+    def public_for_course(self, request):
+        """Get public coupons available for a specific course"""
+        course_id = request.query_params.get('course_id')
+        
+        if not course_id:
+            return Response(
+                {"error": "course_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get public, active, non-expired coupons for this course (or all courses)
+        from apps.enrollments.api.serializers import PublicCouponSerializer
+        from django.db.models import Q
+        
+        valid_coupons = Coupon.objects.filter(
+            is_public=True,
+            is_active=True
+        ).filter(
+            Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
+        ).filter(
+            Q(course__isnull=True) | Q(course_id=course_id)
+        )
+        
+        serializer = PublicCouponSerializer(valid_coupons, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'])
+    def valid_codes_for_course(self, request):
+        """Get all valid coupon codes (public + private) for a course - just the codes for frontend validation"""
+        course_id = request.query_params.get('course_id')
+        
+        if not course_id:
+            return Response(
+                {"error": "course_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from django.db.models import Q
+        
+        # Get ALL valid coupons for this course (both public and private)
+        valid_coupons = Coupon.objects.filter(
+            is_active=True
+        ).filter(
+            Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
+        ).filter(
+            Q(course__isnull=True) | Q(course_id=course_id)
+        ).values_list('code', flat=True)
+        
+        # Return just the uppercase codes for frontend matching
+        codes = [code.upper() for code in valid_coupons]
+        return Response({"codes": codes}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'])
     def validate(self, request):
         """Validate a coupon code and return discount information"""
         code = request.query_params.get('code')
+        course_id = request.query_params.get('course_id')
+        
         if not code:
             return Response(
                 {"error": "Coupon code is required"},
@@ -1306,57 +1380,72 @@ class CouponViewSet(viewsets.ModelViewSet):
         tuition_fee = request.query_params.get('tuition_fee')
 
         try:
-            coupon = Coupon.objects.get(code=code)
+            # Case-insensitive coupon lookup
+            coupon = Coupon.objects.get(code__iexact=code)
 
-            # Check if coupon is expired
-            if coupon.expires_at < timezone.now():  # Use timezone.now() instead of date.today()
+            # Check if coupon is valid
+            if not coupon.is_valid:
+                if not coupon.is_active:
+                    return Response(
+                        {"error": "This coupon is no longer active"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
                 return Response(
                     {"error": "This coupon has expired"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Check if coupon applies to the course
+            if course_id and not coupon.applies_to_course(int(course_id)):
+                return Response(
+                    {"error": "This coupon does not apply to this course"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
             # Initialize response with coupon data
             response_data = CouponSerializer(coupon).data
 
-            # Calculate benefits if fees are provided
+            # Calculate benefits based on the new discount amounts
             benefits = []
-            if 'ADMISSION' in coupon.discount_types:
+            from decimal import Decimal
+            
+            if coupon.admission_fee_discount > 0:
+                original = Decimal(admission_fee) if admission_fee else None
+                new_amount = max(Decimal('0'), original - coupon.admission_fee_discount) if original is not None else None
                 benefits.append({
                     "type": "ADMISSION",
-                    "description": "Admission fee waived",
-                    "original_amount": admission_fee if admission_fee else None,
-                    "new_amount": "0.00"
+                    "description": f"৳{coupon.admission_fee_discount} off admission fee",
+                    "discount_amount": str(coupon.admission_fee_discount),
+                    "original_amount": str(original) if original is not None else None,
+                    "new_amount": str(new_amount) if new_amount is not None else None
                 })
 
-            if 'FIRST_MONTH' in coupon.discount_types:
+            # Calculate Tuition (Recurring) and First Month (Stackable)
+            current_tuition = Decimal(tuition_fee) if tuition_fee else None
+            recurring_tuition = current_tuition  # Base for first month if no tuition discount
+
+            if coupon.tuition_fee_discount > 0:
+                new_recurring = max(Decimal('0'), current_tuition - coupon.tuition_fee_discount) if current_tuition is not None else None
+                benefits.append({
+                    "type": "TUITION",
+                    "description": f"৳{coupon.tuition_fee_discount} off monthly tuition fee",
+                    "discount_amount": str(coupon.tuition_fee_discount),
+                    "original_amount": str(current_tuition) if current_tuition is not None else None,
+                    "new_amount": str(new_recurring) if new_recurring is not None else None
+                })
+                if new_recurring is not None:
+                    recurring_tuition = new_recurring
+
+            if coupon.first_month_discount > 0:
+                # Applies on top of recurring tuition (which might be already discounted)
+                new_first_month = max(Decimal('0'), recurring_tuition - coupon.first_month_discount) if recurring_tuition is not None else None
                 benefits.append({
                     "type": "FIRST_MONTH",
-                    "description": "First month tuition fee waived",
-                    "original_amount": tuition_fee if tuition_fee else None,
-                    "new_amount": "0.00"
+                    "description": f"৳{coupon.first_month_discount} off first month fee",
+                    "discount_amount": str(coupon.first_month_discount),
+                    "original_amount": str(recurring_tuition) if recurring_tuition is not None else None,
+                    "new_amount": str(new_first_month) if new_first_month is not None else None
                 })
-
-            if 'TUITION' in coupon.discount_types and coupon.discount_value:
-                if tuition_fee:
-                    from decimal import Decimal
-                    tuition_fee_decimal = Decimal(tuition_fee)
-                    discount_amount = (tuition_fee_decimal * coupon.discount_value) / 100
-                    new_amount = tuition_fee_decimal - discount_amount
-
-                    benefits.append({
-                        "type": "TUITION",
-                        "description": f"{coupon.discount_value}% discount on tuition fee",
-                        "original_amount": str(tuition_fee_decimal),
-                        "new_amount": str(new_amount),
-                        "discount_amount": str(discount_amount),
-                        "discount_percentage": str(coupon.discount_value)
-                    })
-                else:
-                    benefits.append({
-                        "type": "TUITION",
-                        "description": f"{coupon.discount_value}% discount on tuition fee",
-                        "discount_percentage": str(coupon.discount_value)
-                    })
 
             response_data["benefits"] = benefits
 
@@ -1366,3 +1455,4 @@ class CouponViewSet(viewsets.ModelViewSet):
                 {"error": "Invalid coupon code"},
                 status=status.HTTP_404_NOT_FOUND
             )
+

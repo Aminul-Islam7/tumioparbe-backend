@@ -8,6 +8,14 @@ class Course(models.Model):
     admission_fee = models.DecimalField(max_digits=10, decimal_places=2)
     monthly_fee = models.DecimalField(max_digits=10, decimal_places=2)
     is_active = models.BooleanField(default=True)
+    featured_coupon = models.ForeignKey(
+        'enrollments.Coupon',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='featured_on_courses',
+        help_text="Public coupon to display as promotional offer on this course"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

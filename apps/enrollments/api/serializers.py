@@ -7,72 +7,62 @@ from django.utils import timezone  # Use Django's timezone utilities instead of 
 
 
 class CouponSerializer(serializers.ModelSerializer):
-    discount_types_display = serializers.SerializerMethodField()
     is_expired = serializers.SerializerMethodField()
+    is_valid = serializers.SerializerMethodField()
+    course_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Coupon
-        fields = ['id', 'code', 'name', 'discount_types', 'discount_types_display',
-                  'discount_value', 'expires_at', 'is_expired']
-        read_only_fields = ['id', 'discount_types_display', 'is_expired']
-
-    def get_discount_types_display(self, obj):
-        """Return human-readable descriptions of the discount types"""
-        type_map = {
-            'TUITION': 'Tuition Discount',
-            'ADMISSION': 'Admission Fee Waiver',
-            'FIRST_MONTH': 'First Month Waiver'
-        }
-
-        types = []
-        for discount_type in obj.discount_types:
-            if discount_type in type_map:
-                types.append(type_map[discount_type])
-
-        return types
+        fields = [
+            'id', 'code', 'description', 'offer_message', 'course', 'course_name',
+            'is_public', 'admission_fee_discount', 'tuition_fee_discount', 
+            'first_month_discount', 'expires_at', 'is_active', 'is_expired', 'is_valid',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'is_expired', 'is_valid', 'course_name', 'created_at', 'updated_at']
 
     def get_is_expired(self, obj):
         """Check if the coupon is expired"""
-        return obj.expires_at < timezone.now()  # Use timezone.now() instead of datetime.now()
+        if obj.expires_at is None:
+            return False
+        return obj.expires_at < timezone.now()
+    
+    def get_is_valid(self, obj):
+        """Check if the coupon is valid (active and not expired)"""
+        return obj.is_valid
+    
+    def get_course_name(self, obj):
+        """Get the course name or 'All Courses' for null"""
+        return obj.course.name if obj.course else "All Courses"
 
     def validate_expires_at(self, value):
-        """Validate that the expiration date is in the future"""
-        if value < timezone.now():  # Use timezone.now() instead of datetime.now()
+        """Validate that the expiration date is in the future for new coupons"""
+        if value and self.instance is None and value < timezone.now():
             raise serializers.ValidationError("Expiration date must be in the future")
         return value
-
-    def validate_discount_types(self, value):
-        """Validate that discount types are valid"""
-        valid_types = ['TUITION', 'ADMISSION', 'FIRST_MONTH']
-
-        if not isinstance(value, list):
-            raise serializers.ValidationError("Discount types must be a list")
-
-        if not value:
-            raise serializers.ValidationError("At least one discount type must be provided")
-
-        for discount_type in value:
-            if discount_type not in valid_types:
-                raise serializers.ValidationError(f"Invalid discount type: {discount_type}")
-
-        # If TUITION is selected, discount_value is required
-        if 'TUITION' in value and self.initial_data.get('discount_value') is None:
-            raise serializers.ValidationError("Discount value is required for tuition discount")
-
-        return value
-
+    
     def validate(self, data):
-        """Additional cross-field validation"""
-        discount_types = data.get('discount_types', [])
-        discount_value = data.get('discount_value')
-
-        # If TUITION is not selected but discount_value is provided, warn
-        if 'TUITION' not in discount_types and discount_value is not None:
-            raise serializers.ValidationError({
-                "discount_value": "Discount value is only used for tuition discounts"
-            })
-
+        """Validate that at least one discount amount is provided"""
+        admission = data.get('admission_fee_discount', 0)
+        tuition = data.get('tuition_fee_discount', 0)
+        first_month = data.get('first_month_discount', 0)
+        
+        if admission == 0 and tuition == 0 and first_month == 0:
+            raise serializers.ValidationError(
+                "At least one discount amount must be greater than 0"
+            )
+        
         return data
+
+
+class PublicCouponSerializer(serializers.ModelSerializer):
+    """Simplified serializer for public coupons shown to parents"""
+    class Meta:
+        model = Coupon
+        fields = [
+            'id', 'code', 'offer_message', 'description',
+            'admission_fee_discount', 'tuition_fee_discount', 'first_month_discount'
+        ]
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):
@@ -125,14 +115,37 @@ class EnrollmentInitiateSerializer(serializers.Serializer):
     coupon_code = serializers.CharField(required=False, allow_blank=True)
 
     def validate_coupon_code(self, value):
-        """Validate that the coupon exists and is not expired"""
+        """Validate that the coupon exists, is valid, and applies to the batch's course"""
         if not value:
             return value
 
         try:
-            coupon = Coupon.objects.get(code=value)
-            if coupon.expires_at < timezone.now():  # Use timezone.now() instead of datetime.now()
+            # Case-insensitive coupon lookup
+            coupon = Coupon.objects.get(code__iexact=value)
+            if not coupon.is_valid:
+                if not coupon.is_active:
+                    raise serializers.ValidationError("This coupon is no longer active")
                 raise serializers.ValidationError("This coupon has expired")
             return value
         except Coupon.DoesNotExist:
             raise serializers.ValidationError("Invalid coupon code")
+    
+    def validate(self, data):
+        """Additional validation to ensure coupon applies to the batch's course"""
+        coupon_code = data.get('coupon_code')
+        batch_id = data.get('batch')
+        
+        if coupon_code and batch_id:
+            from apps.courses.models import Batch
+            try:
+                batch = Batch.objects.get(id=batch_id)
+                # Case-insensitive coupon lookup
+                coupon = Coupon.objects.get(code__iexact=coupon_code)
+                if not coupon.applies_to_course(batch.course_id):
+                    raise serializers.ValidationError({
+                        "coupon_code": "This coupon does not apply to this course"
+                    })
+            except (Batch.DoesNotExist, Coupon.DoesNotExist):
+                pass  # Let other validators handle these errors
+        
+        return data
