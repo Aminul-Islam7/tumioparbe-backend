@@ -1,5 +1,5 @@
 from rest_framework import status, viewsets
-from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.decorators import api_view, permission_classes, authentication_classes, action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -22,7 +22,15 @@ from apps.accounts.api.serializers import (
     ChangePasswordSerializer, 
     ResetPasswordSerializer
 )
+from rest_framework.filters import SearchFilter
+from rest_framework.permissions import BasePermission
 from services.sms.client import send_otp
+
+
+class IsAdminUser(BasePermission):
+    """Allow access only to users with is_admin=True."""
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and request.user.is_admin)
 
 # Get logger
 logger = logging.getLogger(__name__)
@@ -299,8 +307,137 @@ class StudentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # Only return students belonging to the authenticated user (parent)
+        if self.request.user.is_staff:
+            queryset = Student.objects.all()
+            parent_id = self.request.query_params.get('parent', None)
+            if parent_id is not None:
+                queryset = queryset.filter(parent_id=parent_id)
+            return queryset
         return Student.objects.filter(parent=self.request.user)
+
+
+class ParentViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for admin to view parent users
+    """
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [SearchFilter]
+    search_fields = ['name', 'phone', 'students__name']
+
+    def get_queryset(self):
+        if self.request.user.is_staff:
+            return User.objects.filter(is_admin=False).distinct()
+        return User.objects.none()
+
+
+class AdminViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for admin to view admin users
+    """
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [SearchFilter]
+    search_fields = ['name', 'phone', 'students__name']
+
+    def get_queryset(self):
+        if self.request.user.is_staff:
+            return User.objects.filter(is_admin=True).distinct()
+        return User.objects.none()
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for viewing and updating all users.
+    Read: any authenticated user (scoped by queryset).
+    Write (PATCH/PUT/DELETE) + custom actions: admin only.
+    """
+    serializer_class = UserSerializer
+    filter_backends = [SearchFilter]
+    search_fields = ['name', 'phone', 'email', 'students__name']
+
+    def get_permissions(self):
+        # Safe read methods open to all authenticated users
+        if self.request.method in ('GET', 'HEAD', 'OPTIONS'):
+            return [IsAuthenticated()]
+        # All mutations require admin
+        return [IsAuthenticated(), IsAdminUser()]
+
+    def get_queryset(self):
+        if self.request.user.is_staff:
+            return User.objects.all().distinct()
+        return User.objects.filter(id=self.request.user.id)
+
+    def destroy(self, request, *args, **kwargs):
+        """Block deletion entirely — users must be deactivated, not deleted."""
+        return Response(
+            {'success': False, 'message': 'User deletion is not permitted via API.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    @action(detail=True, methods=['post'])
+    def grant_admin(self, request, pk=None):
+        """
+        Grant admin privileges to a user. Requires verifying the current admin's password.
+        """
+        if not request.user.is_admin:
+            return Response({'success': False, 'message': 'Only admins can grant admin privileges.'}, status=status.HTTP_403_FORBIDDEN)
+            
+        password = request.data.get('password')
+        if not password:
+            return Response({'success': False, 'message': 'Your current password is required for verification.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        if not request.user.check_password(password):
+            return Response({'success': False, 'message': 'Incorrect password. Verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        user = self.get_object()
+        if user.is_admin:
+            return Response({'success': False, 'message': 'User is already an admin.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        user.is_admin = True
+        user.is_staff = True
+        user.save()
+        
+        return Response({
+            'success': True,
+            'message': f'Successfully granted admin privileges to {user.name}.',
+            'user': self.get_serializer(user).data
+        })
+
+    @action(detail=True, methods=['post'])
+    def revoke_admin(self, request, pk=None):
+        """
+        Revoke admin privileges from a user. Requires verifying the current admin's password.
+        """
+        if not request.user.is_admin:
+            return Response({'success': False, 'message': 'Only admins can revoke admin privileges.'}, status=status.HTTP_403_FORBIDDEN)
+            
+        password = request.data.get('password')
+        if not password:
+            return Response({'success': False, 'message': 'Your current password is required for verification.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        if not request.user.check_password(password):
+            return Response({'success': False, 'message': 'Incorrect password. Verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Prevent self-revocation before hitting DB
+        target_pk = int(self.kwargs.get('pk', 0))
+        if request.user.id == target_pk:
+            return Response({'success': False, 'message': 'You cannot revoke your own admin privileges.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = self.get_object()
+
+        if not user.is_admin:
+            return Response({'success': False, 'message': 'User is not an admin.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        user.is_admin = False
+        user.is_staff = False
+        user.save()
+        
+        return Response({
+            'success': True,
+            'message': f'Successfully revoked admin privileges from {user.name}.',
+            'user': self.get_serializer(user).data
+        })
 
 
 class ProfileView(APIView):

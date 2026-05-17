@@ -17,6 +17,9 @@ class UserSerializer(serializers.ModelSerializer):
         ]
     )
     facebook_profile = serializers.URLField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
         validators=[URLValidator(message='Please enter a valid Facebook profile URL.')]
     )
     email = serializers.EmailField(required=False, allow_blank=True)
@@ -24,12 +27,19 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ('id', 'phone', 'name', 'address', 'facebook_profile',
-                  'email', 'password', 'confirm_password', 'is_admin')
-        read_only_fields = ('id', 'is_admin')
+                  'email', 'password', 'confirm_password', 'is_admin', 'date_joined')
+        read_only_fields = ('id', 'is_admin', 'date_joined')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance is not None:
+            self.fields['password'].required = False
+            self.fields['confirm_password'].required = False
 
     def validate(self, data):
-        if data.get('password') != data.get('confirm_password'):
-            raise serializers.ValidationError({"confirm_password": "Passwords don't match."})
+        if 'password' in data or 'confirm_password' in data:
+            if data.get('password') != data.get('confirm_password'):
+                raise serializers.ValidationError({"confirm_password": "Passwords don't match."})
         return data
 
     def create(self, validated_data):

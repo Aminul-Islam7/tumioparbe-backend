@@ -4,12 +4,18 @@ from rest_framework.routers import DefaultRouter
 from apps.accounts.api.views import (
     StudentViewSet,
     ProfileView,
-    ChangePasswordView
+    ChangePasswordView,
+    ParentViewSet,
+    AdminViewSet,
+    UserViewSet
 )
 
 # Create a router for ViewSets
 router = DefaultRouter()
 router.register(r'students', StudentViewSet, basename='student')
+router.register(r'parents', ParentViewSet, basename='parent')
+router.register(r'admins', AdminViewSet, basename='admin')
+router.register(r'users', UserViewSet, basename='user')
 
 # These URLs require authentication
 urlpatterns = [
