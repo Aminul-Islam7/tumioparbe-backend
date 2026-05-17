@@ -70,13 +70,19 @@ class PaymentViewSet(viewsets.ModelViewSet):
             payment_data = dict(payment_data)
             if payment.invoice and payment.invoice.enrollment:
                 payment_data['student_name'] = payment.invoice.enrollment.student.name
+                payment_data['student_id'] = payment.invoice.enrollment.student.id
                 payment_data['course_name'] = payment.invoice.enrollment.batch.course.name
+                payment_data['course_id'] = payment.invoice.enrollment.batch.course.id
                 payment_data['batch_name'] = payment.invoice.enrollment.batch.name
+                payment_data['batch_id'] = payment.invoice.enrollment.batch.id
                 payment_data['month'] = payment.invoice.month.strftime('%B %Y')
             else:
                 payment_data['student_name'] = None
+                payment_data['student_id'] = None
                 payment_data['course_name'] = None
+                payment_data['course_id'] = None
                 payment_data['batch_name'] = None
+                payment_data['batch_id'] = None
                 payment_data['month'] = payment.invoice.month.strftime('%B %Y') if payment.invoice else None
             result.append(payment_data)
 
