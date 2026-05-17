@@ -38,6 +38,50 @@ class PaymentViewSet(viewsets.ModelViewSet):
     serializer_class = PaymentSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        """Apply select_related so list() can access invoice→enrollment chain efficiently."""
+        return Payment.objects.select_related(
+            'invoice',
+            'invoice__enrollment',
+            'invoice__enrollment__student',
+            'invoice__enrollment__batch',
+            'invoice__enrollment__batch__course',
+        ).order_by('-created_at')
+
+    def list(self, request, *args, **kwargs):
+        """
+        Override list to enrich each payment with student/course/batch/month fields
+        so the admin panel can display enrollment context without a separate call.
+        """
+        queryset = self.get_queryset()
+
+        # Allow admin to filter by status via ?status=Completed etc.
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        # Non-admin users only see their own students' payments
+        if not request.user.is_staff:
+            queryset = queryset.filter(invoice__enrollment__student__parent=request.user)
+
+        serializer = self.get_serializer(queryset, many=True)
+        result = []
+        for payment_data, payment in zip(serializer.data, queryset):
+            payment_data = dict(payment_data)
+            if payment.invoice and payment.invoice.enrollment:
+                payment_data['student_name'] = payment.invoice.enrollment.student.name
+                payment_data['course_name'] = payment.invoice.enrollment.batch.course.name
+                payment_data['batch_name'] = payment.invoice.enrollment.batch.name
+                payment_data['month'] = payment.invoice.month.strftime('%B %Y')
+            else:
+                payment_data['student_name'] = None
+                payment_data['course_name'] = None
+                payment_data['batch_name'] = None
+                payment_data['month'] = payment.invoice.month.strftime('%B %Y') if payment.invoice else None
+            result.append(payment_data)
+
+        return Response(result)
+
     @action(detail=False, methods=['post'])
     def initiate_bkash(self, request):
         """
