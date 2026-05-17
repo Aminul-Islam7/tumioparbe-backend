@@ -252,11 +252,45 @@ class PaymentViewSet(viewsets.ModelViewSet):
         # This handles duplicate requests (e.g., user refresh, network retry)
         if payment.status == Payment.COMPLETED:
             logger.info(f"Payment {payment_id} already completed, returning cached result")
+            
+            # Check if there's an associated enrollment to return
+            enrollment_info = None
+            if payment.invoice and payment.invoice.enrollment:
+                enrollment = payment.invoice.enrollment
+                enrollment_info = {
+                    "id": enrollment.id,
+                    "student_name": enrollment.student.name,
+                    "course_name": enrollment.batch.course.name,
+                    "batch_name": enrollment.batch.name,
+                }
+            elif payment.invoice and payment.invoice.temp_invoice and payment.invoice.temp_invoice_data:
+                # RECOVERY: Payment was completed but enrollment wasn't created
+                # This can happen if the previous request failed after payment but before enrollment
+                logger.warning(f"Payment {payment_id} is complete but has no enrollment - triggering recovery")
+                
+                from apps.payments.services.payment_recovery import PaymentRecoveryService
+                
+                recovery_result = PaymentRecoveryService._create_enrollment_from_temp_invoice(
+                    payment.invoice, payment, request.user
+                )
+                
+                if recovery_result["success"]:
+                    enrollment_info = recovery_result["enrollment"]
+                    logger.info(f"Successfully recovered enrollment for payment {payment_id}")
+                else:
+                    logger.error(f"Failed to recover enrollment for payment {payment_id}: {recovery_result['error']}")
+                    return Response({
+                        "status": "payment_succeeded_enrollment_failed",
+                        "transaction_id": payment.transaction_id,
+                        "message": f"Payment was successful but enrollment recovery failed: {recovery_result['error']}",
+                    }, status=status.HTTP_207_MULTI_STATUS)
+            
             return Response({
                 "status": "success",
                 "transaction_id": payment.transaction_id,
                 "payment_status": payment.status,
-                "message": "Payment was already completed successfully."
+                "message": "Payment was already completed successfully.",
+                "enrollment": enrollment_info
             })
 
         # If payment failed or was cancelled, don't try to execute again
@@ -343,43 +377,157 @@ class PaymentViewSet(viewsets.ModelViewSet):
                                 })
                             else:
                                 # Regular enrollment payment
-                                # Complete the enrollment using the stored data
-                                from apps.enrollments.api.views import EnrollmentViewSet
+                                # Directly create the enrollment using the stored data
+                                from apps.enrollments.api.serializers import EnrollmentSerializer
+                                from apps.accounts.models import Student
+                                from apps.courses.models import Batch
+                                from datetime import date
 
-                                viewset = EnrollmentViewSet()
                                 enrollment_data = invoice.temp_invoice_data
+                                logger.info(f"Creating enrollment directly with data: {enrollment_data}")
 
-                                # Create a proper request object
-                                from rest_framework.test import APIRequestFactory
-                                from rest_framework.request import Request
+                                # First check if enrollment already exists
+                                student_id = enrollment_data.get('student')
+                                batch_id = enrollment_data.get('batch')
 
-                                factory = APIRequestFactory()
-                                api_request = factory.post('/api/enrollments/verify-and-complete-payment/')
-                                api_request.data = {
-                                    'bkash_payment_id': payment_id,
-                                    'enrollment_data': enrollment_data,
-                                    'temp_invoice_id': invoice.id
-                                }
-                                api_request.user = request.user
-                                viewset.request = Request(api_request)
+                                existing_enrollment = Enrollment.objects.filter(
+                                    student_id=student_id,
+                                    batch_id=batch_id,
+                                    is_active=True
+                                ).first()
 
-                                # Complete the enrollment
-                                enrollment_response = viewset.verify_and_complete_payment(api_request)
+                                if existing_enrollment:
+                                    logger.info(f"Found existing enrollment for student {student_id} in batch {batch_id}")
+                                    # Link payment to the existing enrollment's invoice
+                                    first_month_invoice = Invoice.objects.filter(
+                                        enrollment=existing_enrollment,
+                                        month=existing_enrollment.start_month
+                                    ).first()
+                                    if first_month_invoice:
+                                        payment.invoice = first_month_invoice
+                                        payment.save()
+                                    
+                                    # Delete temp invoice
+                                    invoice.delete()
 
-                                if enrollment_response.status_code not in [200, 201]:
-                                    # If enrollment creation fails, roll back the transaction
-                                    raise Exception(f"Enrollment creation failed: {enrollment_response.data}")
+                                    return Response({
+                                        "status": "success",
+                                        "transaction_id": payment.transaction_id,
+                                        "payment_status": payment.status,
+                                        "message": "Payment completed. Enrollment already exists.",
+                                        "enrollment": {
+                                            "id": existing_enrollment.id,
+                                            "student_name": existing_enrollment.student.name,
+                                            "course_name": existing_enrollment.batch.course.name,
+                                            "batch_name": existing_enrollment.batch.name,
+                                        }
+                                    })
 
-                                # Add enrollment info to the response
-                                enrollment_info = enrollment_response.data.get('enrollment', {})
+                                # Create new enrollment
+                                serializer = EnrollmentSerializer(data=enrollment_data)
+                                if serializer.is_valid():
+                                    enrollment = serializer.save()
+                                    logger.info(f"Created new enrollment with ID {enrollment.id}")
 
-                                return Response({
-                                    "status": "success",
-                                    "transaction_id": payment.transaction_id,
-                                    "payment_status": payment.status,
-                                    "message": "Payment completed and enrollment created successfully.",
-                                    "enrollment": enrollment_info
-                                })
+                                    batch = enrollment.batch
+                                    course = batch.course
+
+                                    # Get start month
+                                    first_month_str = enrollment_data.get('start_month')
+                                    first_month = date.fromisoformat(first_month_str)
+
+                                    # Calculate fees
+                                    tuition_fee = enrollment.tuition_fee
+                                    if tuition_fee is None:
+                                        tuition_fee = batch.tuition_fee or course.monthly_fee
+
+                                    coupon_code = enrollment_data.get('coupon_code')
+                                    coupon = None
+                                    first_month_waiver = enrollment_data.get('first_month_waiver', False)
+                                    first_month_fee = Decimal(str(tuition_fee)) if tuition_fee else Decimal('0.00')
+
+                                    if coupon_code:
+                                        try:
+                                            coupon = Coupon.objects.get(code__iexact=coupon_code)
+                                            if coupon.first_month_discount > 0 and not first_month_waiver:
+                                                first_month_fee = max(Decimal('0.00'), first_month_fee - coupon.first_month_discount)
+                                                if first_month_fee == 0:
+                                                    first_month_waiver = True
+                                                    logger.info("First month fee waived due to coupon (calculated)")
+                                                else:
+                                                    logger.info(f"First month fee reduced to {first_month_fee}")
+                                        except Coupon.DoesNotExist:
+                                            logger.warning(f"Coupon code {coupon_code} not found")
+
+                                    # Create first month invoice (paid)
+                                    first_month_invoice = Invoice.objects.create(
+                                        enrollment=enrollment,
+                                        month=first_month,
+                                        amount=first_month_fee,
+                                        is_paid=True,
+                                        coupon=coupon
+                                    )
+                                    logger.info(f"Created first month invoice {first_month_invoice.id}")
+
+                                    # Create next month invoice
+                                    next_month_year = first_month.year + (first_month.month // 12)
+                                    next_month_month = (first_month.month % 12) + 1
+                                    next_month = date(next_month_year, next_month_month, 1)
+                                    next_month_fee = Decimal(str(tuition_fee)) if tuition_fee else Decimal('0.00')
+                                    next_month_is_paid = first_month_waiver  # If first month waived, payment was for next month
+
+                                    next_month_invoice = Invoice.objects.create(
+                                        enrollment=enrollment,
+                                        month=next_month,
+                                        amount=next_month_fee,
+                                        is_paid=next_month_is_paid,
+                                        coupon=coupon if next_month_is_paid else None
+                                    )
+                                    logger.info(f"Created next month invoice {next_month_invoice.id}")
+
+                                    # Link payment to the correct invoice
+                                    if first_month_waiver:
+                                        payment.invoice = next_month_invoice
+                                    else:
+                                        payment.invoice = first_month_invoice
+                                    payment.save()
+
+                                    # Delete the temp invoice
+                                    invoice.delete()
+
+                                    # Log activity
+                                    log_activity(
+                                        user=request.user,
+                                        action_type='ENROLLMENT',
+                                        enrollment_id=enrollment.id,
+                                        student_id=enrollment.student.id,
+                                        student_name=enrollment.student.name,
+                                        course=course.name,
+                                        batch=batch.name,
+                                        start_month=first_month.strftime('%B %Y'),
+                                        tuition_fee=str(tuition_fee),
+                                        coupon_code=coupon_code if coupon_code else None,
+                                        has_first_month_waiver=first_month_waiver,
+                                        payment_id=payment.id,
+                                        transaction_id=payment.transaction_id,
+                                        payment_method="bKash"
+                                    )
+
+                                    return Response({
+                                        "status": "success",
+                                        "transaction_id": payment.transaction_id,
+                                        "payment_status": payment.status,
+                                        "message": "Payment completed and enrollment created successfully.",
+                                        "enrollment": {
+                                            "id": enrollment.id,
+                                            "student_name": enrollment.student.name,
+                                            "course_name": course.name,
+                                            "batch_name": batch.name,
+                                        }
+                                    })
+                                else:
+                                    logger.error(f"Enrollment serializer errors: {serializer.errors}")
+                                    raise Exception(f"Enrollment validation failed: {serializer.errors}")
                     except Exception as e:
                         logger.error(f"Error creating enrollment after payment: {str(e)}")
                         # Since we're using atomic transaction, both payment execution and enrollment
@@ -466,6 +614,58 @@ class PaymentViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"Error querying bKash payment: {str(e)}")
             return Response({"error": "Failed to query bKash payment."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'])
+    def recover_payment(self, request):
+        """
+        Verify and recover a payment that may have failed during enrollment.
+        This endpoint:
+        1. Queries bKash to verify payment status
+        2. If payment is complete, ensures enrollment is created
+        3. Returns detailed status for the frontend to display
+        
+        Use cases:
+        - Frontend execute call failed but payment may have succeeded
+        - User refreshed page during payment processing
+        - Network error after payment authorization
+        """
+        from apps.payments.services.payment_recovery import PaymentRecoveryService
+        
+        payment_id = request.data.get('paymentID')
+        if not payment_id:
+            return Response(
+                {"error": "Payment ID is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        logger.info(f"Payment recovery requested for: {payment_id}")
+        
+        result = PaymentRecoveryService.verify_and_recover_payment(
+            payment_id=payment_id,
+            user=request.user
+        )
+        
+        if result['status'] == 'success':
+            return Response({
+                "status": "success",
+                "message": result['message'],
+                "transaction_id": result.get('transaction_id'),
+                "enrollment": result.get('enrollment'),
+                "recovery_action": result.get('recovery_action')
+            })
+        elif result['status'] == 'partial_success':
+            return Response({
+                "status": "partial_success",
+                "message": result['message'],
+                "transaction_id": result.get('transaction_id'),
+                "recovery_action": result.get('recovery_action')
+            }, status=status.HTTP_207_MULTI_STATUS)
+        else:
+            return Response({
+                "status": "error",
+                "message": result['message'],
+                "recovery_action": result.get('recovery_action')
+            }, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['post'])
     def pay_invoice(self, request):

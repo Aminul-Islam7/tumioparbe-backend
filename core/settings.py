@@ -241,8 +241,13 @@ BKASH_USERNAME = os.getenv('BKASH_USERNAME', '')
 BKASH_PASSWORD = os.getenv('BKASH_PASSWORD', '')
 # BKASH_WEBHOOK_SECRET = os.getenv('BKASH_WEBHOOK_SECRET', '')  # Get this from bKash
 
+# bKash Mock Mode - set to True to simulate bKash responses when the sandbox is down
+# When enabled, create/execute/query will return mock success responses without calling bKash
+BKASH_MOCK_MODE = os.getenv('BKASH_MOCK_MODE', 'False') == 'True'
+
 # bKash Callback URLs for frontend redirection after payment
 FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000')
 BKASH_CALLBACK_SUCCESS_URL = os.getenv('BKASH_CALLBACK_SUCCESS_URL', f"{FRONTEND_BASE_URL}/payment/success")
 BKASH_CALLBACK_FAILURE_URL = os.getenv('BKASH_CALLBACK_FAILURE_URL', f"{FRONTEND_BASE_URL}/payment/failure")
 BKASH_CALLBACK_CANCEL_URL = os.getenv('BKASH_CALLBACK_CANCEL_URL', f"{FRONTEND_BASE_URL}/payment/cancel")
+

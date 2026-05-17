@@ -809,4 +809,97 @@ class PaymentAdmin(SimpleHistoryAdmin):
 
         return HttpResponseRedirect(reverse('admin:payments_payment_change', args=[payment_id]))
 
-    # Keep existing methods for backward compatibility
+    # Batch actions for recovering multiple payments
+    actions = ['recover_selected_payments', 'query_selected_payments', 'find_inconsistent_payments']
+
+    @admin.action(description='Recover selected payments (auto-create missing enrollments)')
+    def recover_selected_payments(self, request, queryset):
+        """Batch recover selected payments using PaymentRecoveryService"""
+        from apps.payments.services.payment_recovery import PaymentRecoveryService
+        
+        recovered = 0
+        failed = 0
+        already_complete = 0
+        
+        for payment in queryset.filter(payment_method='bKash'):
+            if not payment.payment_id:
+                continue
+                
+            result = PaymentRecoveryService.verify_and_recover_payment(
+                payment.payment_id,
+                user=request.user
+            )
+            
+            if result['status'] == 'success':
+                if result.get('recovery_action') == 'enrollment_created':
+                    recovered += 1
+                elif result.get('recovery_action') in ['none_needed', 'already_complete']:
+                    already_complete += 1
+                else:
+                    recovered += 1
+            else:
+                failed += 1
+        
+        if recovered > 0:
+            messages.success(request, f"Successfully recovered {recovered} payment(s).")
+        if already_complete > 0:
+            messages.info(request, f"{already_complete} payment(s) were already complete.")
+        if failed > 0:
+            messages.warning(request, f"Failed to recover {failed} payment(s).")
+
+    @admin.action(description='Query bKash status for selected payments')
+    def query_selected_payments(self, request, queryset):
+        """Batch query bKash status for selected payments"""
+        updated = 0
+        failed = 0
+        
+        for payment in queryset.filter(payment_method='bKash'):
+            if not payment.payment_id:
+                continue
+                
+            try:
+                query_response = bkash_client.query_payment(payment.payment_id)
+                
+                if query_response.get("statusCode") == "0000":
+                    transaction_status = query_response.get('transactionStatus')
+                    
+                    if transaction_status == "Completed":
+                        payment.status = Payment.COMPLETED
+                        payment.transaction_id = query_response.get('trxID', payment.transaction_id)
+                        payment.save()
+                        
+                        if payment.invoice:
+                            payment.invoice.is_paid = True
+                            payment.invoice.save()
+                        
+                        updated += 1
+            except Exception as e:
+                logger.error(f"Error querying payment {payment.payment_id}: {str(e)}")
+                failed += 1
+        
+        if updated > 0:
+            messages.success(request, f"Updated status for {updated} payment(s).")
+        if failed > 0:
+            messages.warning(request, f"Failed to query {failed} payment(s).")
+
+    @admin.action(description='Find inconsistent payments (report only)')
+    def find_inconsistent_payments(self, request, queryset):
+        """Report on inconsistent payments in selection"""
+        from apps.payments.services.payment_recovery import PaymentRecoveryService
+        
+        issues = PaymentRecoveryService.find_inconsistent_payments()
+        
+        # Filter to only show issues for selected payments
+        selected_payment_ids = [p.payment_id for p in queryset if p.payment_id]
+        relevant_issues = [i for i in issues if i.get('payment_id') in selected_payment_ids]
+        
+        if not relevant_issues:
+            messages.success(request, "No inconsistencies found in selected payments!")
+        else:
+            messages.warning(
+                request, 
+                f"Found {len(relevant_issues)} inconsistent payment(s). "
+                f"High severity: {len([i for i in relevant_issues if i['severity'] == 'high'])}, "
+                f"Medium: {len([i for i in relevant_issues if i['severity'] == 'medium'])}"
+            )
+

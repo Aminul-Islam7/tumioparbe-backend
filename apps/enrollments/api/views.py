@@ -268,6 +268,13 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Validate customer_phone format (must be a non-empty string)
+        if not isinstance(customer_phone, str) or not customer_phone.strip():
+            return Response(
+                {"error": "customer_phone must be a non-empty phone number string"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # Extract student and batch details
         student_id = enrollment_data.get('student')
         batch_id = enrollment_data.get('batch')
@@ -431,11 +438,21 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 except Exception as e:
                     temp_invoice.delete()
                     logger.error(f"Error calling bKash API: {str(e)}")
-                    if hasattr(e, 'response'):
-                        logger.error(f"bKash API Response: {e.response.text}")
+                    # Extract and log the actual bKash error response body if available
+                    bkash_detail = None
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            bkash_detail = e.response.json()
+                            logger.error(f"bKash API response body: {bkash_detail}")
+                        except Exception:
+                            bkash_detail = e.response.text
+                            logger.error(f"bKash API raw response: {bkash_detail}")
+                    error_msg = f"Failed to initiate bKash payment: {str(e)}"
+                    if bkash_detail:
+                        error_msg += f" | bKash response: {bkash_detail}"
                     return Response({
-                        "error": f"Failed to initiate bKash payment: {str(e)}"
-                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                        "error": error_msg
+                    }, status=status.HTTP_502_BAD_GATEWAY)
 
             except Exception as e:
                 logger.error(f"Error creating temporary invoice: {str(e)}")
@@ -854,7 +871,12 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                         # Return the existing enrollment
                         return Response({
                             "message": "Enrollment already exists for this student in this batch",
-                            "enrollment": EnrollmentSerializer(existing_enrollment).data,
+                            "enrollment": {
+                                **EnrollmentSerializer(existing_enrollment).data,
+                                "student_name": existing_enrollment.student.name,
+                                "course_name": existing_enrollment.batch.course.name,
+                                "batch_name": existing_enrollment.batch.name,
+                            },
                             "payment_status": "Completed",
                             "transaction_id": payment.transaction_id if 'payment' in locals() else None,
                             "payment_method": "bKash"
@@ -902,10 +924,13 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     if coupon_code:
                         try:
                             coupon = Coupon.objects.get(code__iexact=coupon_code)
-                            if 'FIRST_MONTH' in coupon.discount_types:
-                                first_month_waiver = True
-                                first_month_fee = Decimal('0.00')
-                                logger.info("First month fee waived due to coupon")
+                            if coupon.first_month_discount > 0 and not first_month_waiver:
+                                first_month_fee = max(Decimal('0.00'), first_month_fee - coupon.first_month_discount)
+                                if first_month_fee == 0:
+                                    first_month_waiver = True
+                                    logger.info("First month fee waived due to coupon (calculated)")
+                                else:
+                                    logger.info(f"First month fee reduced to {first_month_fee}")
                         except Coupon.DoesNotExist:
                             logger.warning(f"Coupon code {coupon_code} not found")
 
@@ -1024,7 +1049,12 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     # Return success response
                     response_data = {
                         "message": "Enrollment recovery completed successfully",
-                        "enrollment": serializer.data,
+                        "enrollment": {
+                            **serializer.data,
+                            "student_name": enrollment.student.name,
+                            "course_name": batch.course.name,
+                            "batch_name": batch.name,
+                        },
                         "payment_status": "Completed",
                         "transaction_id": payment.transaction_id if 'payment' in locals() else None,
                         "payment_method": "bKash",
@@ -1212,7 +1242,7 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                 )
 
             # Check if coupon includes tuition discount
-            if 'TUITION' not in coupon.discount_types or not coupon.discount_value:
+            if coupon.tuition_fee_discount <= 0:
                 return Response(
                     {"error": "This coupon does not include tuition fee discounts"},
                     status=status.HTTP_400_BAD_REQUEST
@@ -1234,16 +1264,15 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
                     "enrollment": EnrollmentSerializer(enrollment).data
                 })
 
-            # Calculate the discount percentage
-            discount_percentage = coupon.discount_value
+            # Get the discount amount (fixed amount, not percentage)
+            discount_amount = coupon.tuition_fee_discount
 
             # Apply the discount to all unpaid future invoices
             updated_invoices = []
             with transaction.atomic():
                 for invoice in unpaid_future_invoices:
                     original_amount = invoice.amount
-                    discount_amount = (original_amount * Decimal(str(discount_percentage))) / 100
-                    new_amount = original_amount - discount_amount
+                    new_amount = max(Decimal('0.00'), original_amount - discount_amount)
 
                     # Update the invoice with the discounted amount
                     invoice.amount = new_amount

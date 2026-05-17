@@ -2,6 +2,7 @@ from django.conf import settings
 import requests
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,11 @@ class BkashClient:
         self.token_expiration = None
         self.refresh_token = None
         self.timeout = 30  # 30 seconds timeout as recommended by bKash
-        logger.info(f"BkashClient initialized with base_url: {self.base_url}")
+        self.mock_mode = getattr(settings, 'BKASH_MOCK_MODE', False)
+        if self.mock_mode:
+            logger.warning("BkashClient initialized in MOCK MODE - no real bKash API calls will be made")
+        else:
+            logger.info(f"BkashClient initialized with base_url: {self.base_url}")
 
     def debug_token(self):
         """Debug the token information and credentials"""
@@ -158,6 +163,10 @@ class BkashClient:
             dict: Response data containing paymentID and bkashURL
         """
         try:
+            # Mock mode: return simulated bKash response
+            if self.mock_mode:
+                return self._mock_create_payment(amount, invoice_number, customer_phone, callback_url)
+
             self._ensure_token()
 
             url = f"{self.base_url}/tokenized/checkout/create"
@@ -169,7 +178,7 @@ class BkashClient:
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "Authorization": f"Bearer {self.token}",  # Fix: Add 'Bearer ' prefix
+                "Authorization": self.token,
                 "X-App-Key": self.app_key
             }
 
@@ -197,7 +206,7 @@ class BkashClient:
                 self._ensure_token()
 
                 # Retry with new token
-                headers["Authorization"] = f"Bearer {self.token}"  # Fix: Add 'Bearer ' prefix
+                headers["Authorization"] = self.token
                 logger.info("Retrying with new token...")
                 response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
                 logger.info(f"Retry response status: {response.status_code}")
@@ -229,13 +238,17 @@ class BkashClient:
         Returns:
             dict: Response data with transaction details
         """
+        # Mock mode: return simulated execute response
+        if self.mock_mode:
+            return self._mock_execute_payment(payment_id)
+
         self._ensure_token()
 
         url = f"{self.base_url}/tokenized/checkout/execute"
 
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self.token}",  # Fix: Add 'Bearer ' prefix
+            "Authorization": self.token,
             "X-App-Key": self.app_key
         }
 
@@ -251,7 +264,7 @@ class BkashClient:
                 logger.warning("Received 401 Unauthorized. Refreshing token and retrying...")
                 self.token = None
                 self._ensure_token()
-                headers["Authorization"] = f"Bearer {self.token}"
+                headers["Authorization"] = self.token
                 response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
 
             response.raise_for_status()
@@ -281,6 +294,10 @@ class BkashClient:
         Returns:
             dict: Response data with payment status
         """
+        # Mock mode: return simulated query response
+        if self.mock_mode:
+            return self._mock_query_payment(payment_id)
+
         self._ensure_token()
 
         url = f"{self.base_url}/tokenized/checkout/payment/status"
@@ -288,7 +305,7 @@ class BkashClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": f"Bearer {self.token}",  # Fix: Add 'Bearer ' prefix
+            "Authorization": self.token,
             "X-App-Key": self.app_key
         }
 
@@ -304,7 +321,7 @@ class BkashClient:
                 logger.warning("Received 401 Unauthorized. Refreshing token and retrying...")
                 self.token = None
                 self._ensure_token()
-                headers["Authorization"] = f"Bearer {self.token}"
+                headers["Authorization"] = self.token
                 response = requests.post(url, json=data, headers=headers, timeout=self.timeout)
 
             response.raise_for_status()
@@ -323,3 +340,71 @@ class BkashClient:
                 logger.error(f"Response status: {e.response.status_code}")
                 logger.error(f"Response body: {e.response.text}")
             raise
+
+    # --- Mock Mode Helpers ---
+
+    def _mock_create_payment(self, amount, invoice_number, customer_phone, callback_url):
+        """Return a simulated bKash create payment response."""
+        mock_payment_id = f"MOCK-{uuid.uuid4().hex[:12].upper()}"
+        frontend_base = getattr(settings, 'FRONTEND_BASE_URL', 'http://localhost:3000')
+        mock_bkash_url = (
+            f"{frontend_base}/payment/success"
+            f"?paymentID={mock_payment_id}&status=success"
+        )
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S %Z")
+        logger.warning(
+            f"[MOCK] create_payment: invoice={invoice_number}, amount={amount}, "
+            f"paymentID={mock_payment_id}"
+        )
+        return {
+            "statusCode": "0000",
+            "statusMessage": "Successful",
+            "paymentID": mock_payment_id,
+            "bkashURL": mock_bkash_url,
+            "callbackURL": callback_url,
+            "successCallbackURL": f"{callback_url}?paymentID={mock_payment_id}&status=success",
+            "failureCallbackURL": f"{callback_url}?paymentID={mock_payment_id}&status=failure",
+            "cancelledCallbackURL": f"{callback_url}?paymentID={mock_payment_id}&status=cancel",
+            "amount": str(amount),
+            "intent": "sale",
+            "currency": "BDT",
+            "paymentCreateTime": now,
+            "transactionStatus": "Initiated",
+            "merchantInvoiceNumber": invoice_number,
+        }
+
+    def _mock_execute_payment(self, payment_id):
+        """Return a simulated bKash execute payment response."""
+        mock_trx_id = f"MOCK-TRX-{uuid.uuid4().hex[:8].upper()}"
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S %Z")
+        logger.warning(f"[MOCK] execute_payment: paymentID={payment_id}, trxID={mock_trx_id}")
+        return {
+            "statusCode": "0000",
+            "statusMessage": "Successful",
+            "paymentID": payment_id,
+            "trxID": mock_trx_id,
+            "amount": "0",
+            "currency": "BDT",
+            "intent": "sale",
+            "paymentExecuteTime": now,
+            "paymentCreateTime": now,
+            "transactionStatus": "Completed",
+            "merchantInvoiceNumber": f"MOCK-INV-{payment_id[-6:]}",
+            "payerReference": "01XXXXXXXXX",
+        }
+
+    def _mock_query_payment(self, payment_id):
+        """Return a simulated bKash query payment response."""
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S %Z")
+        logger.warning(f"[MOCK] query_payment: paymentID={payment_id}")
+        return {
+            "statusCode": "0000",
+            "statusMessage": "Successful",
+            "paymentID": payment_id,
+            "trxID": f"MOCK-TRX-{payment_id[-8:]}",
+            "amount": "0",
+            "currency": "BDT",
+            "transactionStatus": "Completed",
+            "paymentCreateTime": now,
+            "paymentExecuteTime": now,
+        }
