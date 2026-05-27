@@ -72,6 +72,68 @@ class StudentSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+class AdminEnrollmentInfoSerializer(serializers.Serializer):
+    """Lightweight enrollment info nested inside AdminStudentSerializer."""
+    enrollment_id = serializers.IntegerField(source='id')
+    batch_id = serializers.IntegerField(source='batch.id')
+    batch_name = serializers.CharField(source='batch.name')
+    course_id = serializers.IntegerField(source='batch.course.id')
+    course_name = serializers.CharField(source='batch.course.name')
+    start_month = serializers.DateField()
+    tuition_fee = serializers.DecimalField(max_digits=10, decimal_places=2, allow_null=True)
+    effective_tuition_fee = serializers.SerializerMethodField()
+    is_active = serializers.BooleanField()
+
+    def get_effective_tuition_fee(self, obj):
+        # Use enrollment-level fee if set, else fall back to batch fee, then course fee
+        if obj.tuition_fee is not None:
+            return obj.tuition_fee
+        if obj.batch.tuition_fee is not None:
+            return obj.batch.tuition_fee
+        return obj.batch.course.monthly_fee
+
+
+class AdminStudentSerializer(serializers.ModelSerializer):
+    """
+    Admin-only serializer for the Students management page.
+    Includes nested parent details and all enrollment history.
+    Do NOT use this for the parent-facing API — use StudentSerializer instead.
+    """
+    # Parent fields (flattened for easy consumption)
+    parent_id = serializers.IntegerField(source='parent.id', read_only=True)
+    parent_name = serializers.CharField(source='parent.name', read_only=True)
+    parent_phone = serializers.CharField(source='parent.phone', read_only=True)
+    parent_address = serializers.CharField(source='parent.address', read_only=True)
+    parent_facebook = serializers.URLField(source='parent.facebook_profile', read_only=True, allow_null=True)
+
+    # All enrollments (active + inactive) for the Enrollment Manager modal
+    enrollments = AdminEnrollmentInfoSerializer(many=True, read_only=True)
+
+    # Computed age in full years
+    age = serializers.SerializerMethodField()
+
+    # Date added
+    created_at = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = Student
+        fields = (
+            'id', 'name', 'date_of_birth', 'age',
+            'school', 'current_class',
+            'father_name', 'mother_name',
+            'parent_id', 'parent_name', 'parent_phone', 'parent_address', 'parent_facebook',
+            'enrollments',
+            'created_at',
+        )
+        read_only_fields = fields
+
+    def get_age(self, obj):
+        from datetime import date
+        today = date.today()
+        dob = obj.date_of_birth
+        return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
 class ChangePasswordSerializer(serializers.Serializer):
     """Serializer for changing password while logged in"""
     current_password = serializers.CharField(required=True, write_only=True)

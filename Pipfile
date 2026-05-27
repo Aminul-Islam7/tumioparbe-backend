@@ -4,7 +4,6 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-django = "*"
 djangorestframework = "*"
 django-cors-headers = "*"
 pillow = "*"
@@ -19,6 +18,7 @@ python-dotenv = "*"
 django-celery-results = "*"
 django-celery-beat = "*"
 django-simple-history = "*"
+django = "*"
 
 [dev-packages]
 

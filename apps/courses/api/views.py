@@ -116,17 +116,30 @@ class BatchViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         Filter batches based on user role:
-        - Staff see all batches
+        - Staff see all batches (filtered by query params if provided)
         - Regular users see visible batches plus any they're enrolled in
         """
+        queryset = Batch.objects.all()
+
+        # Filter by course query parameter if provided
+        course_id = self.request.query_params.get('course')
+        if course_id:
+            queryset = queryset.filter(course_id=course_id)
+
+        # Filter by is_visible query parameter if provided
+        is_visible = self.request.query_params.get('is_visible')
+        if is_visible:
+            is_visible_bool = is_visible.lower() in ['true', '1']
+            queryset = queryset.filter(is_visible=is_visible_bool)
+
         if self.request.user.is_staff:
-            return Batch.objects.all()
+            return queryset
 
         # For regular users:
         user = self.request.user
 
         # Get all batches where is_visible=True
-        visible_batches = Batch.objects.filter(is_visible=True, course__is_active=True)
+        visible_batches = queryset.filter(is_visible=True, course__is_active=True)
 
         # Also include batches the user's students are enrolled in, even if not visible
         enrolled_batch_ids = Enrollment.objects.filter(
@@ -134,7 +147,7 @@ class BatchViewSet(viewsets.ModelViewSet):
             is_active=True
         ).values_list('batch_id', flat=True)
 
-        enrolled_batches = Batch.objects.filter(id__in(enrolled_batch_ids))
+        enrolled_batches = queryset.filter(id__in=enrolled_batch_ids)
 
         # Combine querysets
         return (visible_batches | enrolled_batches).distinct()

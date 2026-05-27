@@ -18,10 +18,13 @@ import re
 from apps.accounts.models import Student
 from apps.accounts.api.serializers import (
     UserSerializer, 
-    StudentSerializer, 
+    StudentSerializer,
+    AdminStudentSerializer,
     ChangePasswordSerializer, 
     ResetPasswordSerializer
 )
+from django.utils import timezone
+from datetime import date
 from rest_framework.filters import SearchFilter
 from rest_framework.permissions import BasePermission
 from services.sms.client import send_otp
@@ -301,19 +304,99 @@ class RegisterView(APIView):
 
 class StudentViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for managing student profiles
+    ViewSet for managing student profiles.
+    Admin users get a richer serializer with parent info and enrollment details,
+    plus comprehensive filtering capabilities.
     """
-    serializer_class = StudentSerializer
     permission_classes = [IsAuthenticated]
 
-    def get_queryset(self):
+    def get_serializer_class(self):
         if self.request.user.is_staff:
-            queryset = Student.objects.all()
-            parent_id = self.request.query_params.get('parent', None)
-            if parent_id is not None:
-                queryset = queryset.filter(parent_id=parent_id)
-            return queryset
-        return Student.objects.filter(parent=self.request.user)
+            return AdminStudentSerializer
+        return StudentSerializer
+
+    def get_queryset(self):
+        if not self.request.user.is_staff:
+            # Parents only see their own children
+            return Student.objects.filter(parent=self.request.user)
+
+        # Admin: start with all students, optimized with select/prefetch
+        queryset = Student.objects.select_related('parent').prefetch_related(
+            'enrollments__batch__course'
+        )
+
+        params = self.request.query_params
+
+        # --- text search: student name, father/mother name, parent name/phone, school ---
+        search = params.get('search', '').strip()
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) |
+                Q(father_name__icontains=search) |
+                Q(mother_name__icontains=search) |
+                Q(school__icontains=search) |
+                Q(parent__name__icontains=search) |
+                Q(parent__phone__icontains=search)
+            ).distinct()
+
+        # --- filter by specific parent user ---
+        parent_id = params.get('parent')
+        if parent_id:
+            queryset = queryset.filter(parent_id=parent_id)
+
+        # --- filter by batch ---
+        batch_id = params.get('batch')
+        if batch_id:
+            queryset = queryset.filter(enrollments__batch_id=batch_id).distinct()
+
+        # --- filter by course (via enrollment -> batch -> course) ---
+        course_id = params.get('course')
+        if course_id:
+            queryset = queryset.filter(enrollments__batch__course_id=course_id).distinct()
+
+        # --- filter by current_class (exact match) ---
+        current_class = params.get('current_class', '').strip()
+        if current_class:
+            queryset = queryset.filter(current_class=current_class)
+
+        # --- filter by enrollment status ---
+        has_active = params.get('has_active_enrollment', '').lower()
+        if has_active == 'true':
+            queryset = queryset.filter(enrollments__is_active=True).distinct()
+        elif has_active == 'false':
+            queryset = queryset.exclude(enrollments__is_active=True).distinct()
+
+        # --- age range filter ---
+        today = date.today()
+        min_age = params.get('min_age')
+        max_age = params.get('max_age')
+        if min_age:
+            try:
+                min_age_int = int(min_age)
+                # A student is at least min_age if their DOB is on or before today minus min_age years
+                max_dob = today.replace(year=today.year - min_age_int)
+                queryset = queryset.filter(date_of_birth__lte=max_dob)
+            except (ValueError, TypeError):
+                pass
+        if max_age:
+            try:
+                max_age_int = int(max_age)
+                # A student is at most max_age if their DOB is after today minus (max_age+1) years
+                min_dob = today.replace(year=today.year - max_age_int - 1)
+                queryset = queryset.filter(date_of_birth__gt=min_dob)
+            except (ValueError, TypeError):
+                pass
+
+        # --- ordering ---
+        ordering = params.get('ordering', '-created_at')
+        allowed_orderings = ['name', '-name', 'date_of_birth', '-date_of_birth', 'created_at', '-created_at']
+        if ordering in allowed_orderings:
+            queryset = queryset.order_by(ordering)
+        else:
+            queryset = queryset.order_by('-created_at')
+
+        return queryset
 
 
 class ParentViewSet(viewsets.ReadOnlyModelViewSet):
