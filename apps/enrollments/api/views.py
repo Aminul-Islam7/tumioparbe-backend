@@ -39,6 +39,146 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
         # For staff/admin users, show all enrollments
         return Enrollment.objects.all()
 
+    def create(self, request, *args, **kwargs):
+        """
+        Override create to handle admin-side direct enrollment.
+        If active enrollment already exists in course, reuse it instead of error.
+        """
+        student_id = request.data.get('student')
+        batch_id = request.data.get('batch')
+        
+        if student_id and batch_id and request.user.is_staff:
+            try:
+                batch = Batch.objects.get(id=batch_id)
+                course_id = batch.course_id
+                
+                # Check for existing active enrollment in the same course
+                existing_active = Enrollment.objects.filter(
+                    student_id=student_id,
+                    batch__course_id=course_id,
+                    is_active=True
+                ).first()
+                
+                if existing_active:
+                    start_month = request.data.get('start_month')
+                    tuition_fee = request.data.get('tuition_fee')
+                    
+                    existing_active.batch = batch
+                    if start_month:
+                        existing_active.start_month = start_month
+                    if tuition_fee is not None:
+                        # Empty string or None tuition fee means default
+                        if tuition_fee == '':
+                            existing_active.tuition_fee = None
+                        else:
+                            existing_active.tuition_fee = tuition_fee
+                    
+                    existing_active.save()
+                    
+                    serializer = self.get_serializer(existing_active)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+            except Batch.DoesNotExist:
+                pass
+                
+        return super().create(request, *args, **kwargs)
+
+    def merge_enrollment_invoices(self, source_enrollment, target_enrollment):
+        """
+        Safely transfers invoices from source_enrollment to target_enrollment.
+        Resolves unique_together constraint conflicts by preferring paid invoices and transferring payments.
+        """
+        from django.db import transaction
+        from apps.payments.models import Invoice
+        
+        with transaction.atomic():
+            for src_invoice in list(source_enrollment.invoices.all()):
+                # Check if target already has an invoice for this month
+                target_invoice = Invoice.objects.filter(
+                    enrollment=target_enrollment,
+                    month=src_invoice.month
+                ).first()
+                
+                if target_invoice:
+                    # Conflict! Prefer the paid one
+                    if src_invoice.is_paid and not target_invoice.is_paid:
+                        # Target is unpaid, source is paid. Keep source.
+                        # Transfer any payments from target_invoice to src_invoice before deleting target_invoice
+                        target_invoice.payments.all().update(invoice=src_invoice)
+                        target_invoice.delete()
+                        src_invoice.enrollment = target_enrollment
+                        src_invoice.save()
+                    else:
+                        # Keep target. Transfer payments from src_invoice to target_invoice before deleting src_invoice
+                        src_invoice.payments.all().update(invoice=target_invoice)
+                        src_invoice.delete()
+                else:
+                    # No conflict. Safe to update
+                    src_invoice.enrollment = target_enrollment
+                    src_invoice.save()
+
+    def update(self, request, *args, **kwargs):
+        """
+        Override update to handle conflicts gracefully.
+        If reactivating, automatically deactivate conflicting active enrollment first.
+        """
+        instance = self.get_object()
+        
+        # Check if we are reactivating or updating an active enrollment
+        is_active = request.data.get('is_active')
+        batch_id = request.data.get('batch')
+        
+        # If is_active is set to True, or is already active and not explicitly deactivated
+        if is_active is True or (is_active is None and instance.is_active):
+            # Determine course ID of target batch
+            batch = instance.batch
+            if batch_id:
+                try:
+                    batch = Batch.objects.get(id=batch_id)
+                except Batch.DoesNotExist:
+                    pass
+            
+            # Find any other active enrollment for the student in this course
+            existing_active = Enrollment.objects.filter(
+                student=instance.student,
+                batch__course_id=batch.course_id,
+                is_active=True
+            ).exclude(pk=instance.pk).first()
+            
+            if existing_active and request.user.is_staff:
+                # Auto-deactivate the other active enrollment safely (handling duplicate inactive records)
+                duplicate_inactive = Enrollment.objects.filter(
+                    student=existing_active.student,
+                    batch=existing_active.batch,
+                    is_active=False
+                ).first()
+                
+                if duplicate_inactive:
+                    self.merge_enrollment_invoices(existing_active, duplicate_inactive)
+                    existing_active.delete()
+                else:
+                    existing_active.is_active = False
+                    existing_active.save()
+                    
+        # If the instance itself is being deactivated (is_active=False)
+        if is_active is False and instance.is_active:
+            duplicate_inactive = Enrollment.objects.filter(
+                student=instance.student,
+                batch=instance.batch,
+                is_active=False
+            ).exclude(pk=instance.pk).first()
+            
+            if duplicate_inactive and request.user.is_staff:
+                # Transfer invoices to existing inactive record and delete current to avoid UNIQUE constraint error
+                self.merge_enrollment_invoices(instance, duplicate_inactive)
+                instance.delete()
+                serializer = self.get_serializer(duplicate_inactive)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+                
+        return super().update(request, *args, **kwargs)
+
+
+
+
     @action(detail=False, methods=['post'])
     def initiate(self, request):
         """

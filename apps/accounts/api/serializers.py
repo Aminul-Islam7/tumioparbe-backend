@@ -77,6 +77,7 @@ class AdminEnrollmentInfoSerializer(serializers.Serializer):
     enrollment_id = serializers.IntegerField(source='id')
     batch_id = serializers.IntegerField(source='batch.id')
     batch_name = serializers.CharField(source='batch.name')
+    batch_timing = serializers.CharField(source='batch.timing', read_only=True)
     course_id = serializers.IntegerField(source='batch.course.id')
     course_name = serializers.CharField(source='batch.course.name')
     start_month = serializers.DateField()
@@ -125,7 +126,12 @@ class AdminStudentSerializer(serializers.ModelSerializer):
             'enrollments',
             'created_at',
         )
-        read_only_fields = fields
+        read_only_fields = (
+            'id', 'age',
+            'parent_id', 'parent_name', 'parent_phone', 'parent_address', 'parent_facebook',
+            'enrollments',
+            'created_at',
+        )
 
     def get_age(self, obj):
         from datetime import date

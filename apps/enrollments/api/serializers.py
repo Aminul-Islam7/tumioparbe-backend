@@ -78,12 +78,13 @@ class EnrollmentSerializer(serializers.ModelSerializer):
 
     def validate_start_month(self, value):
         """Validate that start_month is not in the past"""
-        today = date.today()
-        # Get the first day of current month
-        current_month = date(today.year, today.month, 1)
+        if self.instance is None:
+            today = date.today()
+            # Get the first day of current month
+            current_month = date(today.year, today.month, 1)
 
-        if value < current_month:
-            raise serializers.ValidationError("Start month cannot be in the past")
+            if value < current_month:
+                raise serializers.ValidationError("Start month cannot be in the past")
         return value
 
     def validate(self, data):
